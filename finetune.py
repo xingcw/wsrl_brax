@@ -6,7 +6,7 @@ import jax
 import numpy as np
 import tqdm
 from absl import app, flags, logging
-from flax.training import checkpoints
+import orbax.checkpoint as ocp
 from ml_collections import config_flags
 
 from experiments.configs.ensemble_config import add_redq_config
@@ -137,6 +137,12 @@ def main(_):
         wandb_logger.config.project,
         f"{wandb_logger.config.exp_descriptor}_{wandb_logger.config.unique_identifier}",
     )
+    
+    # Initialize Orbax checkpoint manager for saving
+    checkpoint_options = ocp.CheckpointManagerOptions(max_to_keep=30)
+    ckpt_manager = ocp.CheckpointManager(
+        save_dir, options=checkpoint_options
+    )
 
     """
     env
@@ -216,7 +222,8 @@ def main(_):
 
     if FLAGS.resume_path != "":
         assert os.path.exists(FLAGS.resume_path), "resume path does not exist"
-        agent = checkpoints.restore_checkpoint(FLAGS.resume_path, target=agent)
+        # Use Orbax to restore checkpoint
+        agent = ocp.StandardCheckpointer().restore(FLAGS.resume_path, target=agent)
 
     """
     eval function
@@ -405,10 +412,9 @@ def main(_):
         """
         if step % FLAGS.save_interval == 0 or step == FLAGS.num_offline_steps:
             logging.info("Saving checkpoint...")
-            checkpoint_path = checkpoints.save_checkpoint(
-                save_dir, agent, step=step, keep=30
-            )
-            logging.info("Saved checkpoint to %s", checkpoint_path)
+            # Use Orbax CheckpointManager to save
+            ckpt_manager.save(step, args=ocp.args.StandardSave(agent))
+            logging.info("Saved checkpoint at step %d to %s", step, save_dir)
 
         timer.tock("total")
 
