@@ -223,7 +223,14 @@ def main(_):
     if FLAGS.resume_path != "":
         assert os.path.exists(FLAGS.resume_path), "resume path does not exist"
         # Use Orbax to restore checkpoint
-        agent = ocp.StandardCheckpointer().restore(FLAGS.resume_path, target=agent)
+        # CheckpointManager saves checkpoints with a 'default' subdirectory structure
+        # so we need to restore from the 'default' subdirectory
+        restore_path = os.path.join(FLAGS.resume_path, "default")
+        if os.path.exists(restore_path):
+            agent = ocp.StandardCheckpointer().restore(restore_path, target=agent)
+        else:
+            # Fallback for checkpoints saved directly without CheckpointManager
+            agent = ocp.StandardCheckpointer().restore(FLAGS.resume_path, target=agent)
 
     """
     eval function
