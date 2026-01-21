@@ -1,5 +1,7 @@
 """
 Finetuning script for Brax environments with wsrl.
+Uses pure Brax (no Gym wrapper) for faster vectorized training.
+
 Note: To use Q-network loading, the Brax checkpoint must be saved with save_q_network=True
 in the train_sac_brax.py script.
 """
@@ -16,7 +18,7 @@ os.environ["GRPC_VERBOSITY"] = "ERROR"  # Suppress gRPC warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-from functools import partial
+from typing import Optional
 
 import logging as python_logging
 # Reduce logging verbosity BEFORE importing JAX
@@ -30,6 +32,7 @@ import absl.logging
 absl.logging.set_verbosity(absl.logging.WARNING)
 
 import jax
+import jax.numpy as jnp
 # Suppress JAX info logs
 jax.config.update("jax_log_compiles", False)
 import numpy as np
@@ -38,20 +41,25 @@ from absl import app, flags, logging
 import orbax.checkpoint as ocp
 from ml_collections import config_flags
 
+from brax import envs as brax_envs
+
 from wsrl.agents import agents
 from wsrl.common.wandb import WandBLogger
-from wsrl.data.replay_buffer import ReplayBuffer
 from wsrl.utils.timer_utils import Timer
 from wsrl.utils.train_utils import subsample_batch
 
 # Brax-specific imports
-from wsrl.envs.brax_wrapper import make_brax_env
 from wsrl.envs.brax_dataset import (
     create_dummy_dataset_from_brax_env,
     load_brax_sac_checkpoint,
 )
-from wsrl.utils.brax_utils import BraxNormalizer, load_brax_q_network_to_wsrl_agent
-from wsrl.common.brax_evaluation import evaluate_brax_native, evaluate_with_trajectories_jit_multi_episode
+from wsrl.utils.brax_utils import (
+    BraxNormalizer,
+    load_brax_q_network_to_wsrl_agent,
+    load_brax_policy_to_wsrl_agent,
+    convert_wsrl_actor_to_brax_policy,
+)
+from wsrl.common.brax_evaluation import evaluate_brax_native
 
 FLAGS = flags.FLAGS
 
@@ -63,7 +71,6 @@ flags.DEFINE_string("brax_ckpt_path", "", "Path to Brax SAC checkpoint to load f
 flags.DEFINE_integer("brax_ckpt_idx", -1, "Checkpoint index to load (-1 for latest)")
 flags.DEFINE_list("brax_hidden_dims", ["256", "256"], "Hidden layer sizes for policy network")
 flags.DEFINE_integer("brax_num_eval_envs", 128, "Number of parallel envs for Brax native evaluation")
-flags.DEFINE_bool("brax_native_eval", True, "Also run Brax native evaluation for comparison")
 flags.DEFINE_bool("load_brax_q_network", False, "Load Q-network from Brax checkpoint for wsrl finetuning")
 
 # Reward settings
@@ -78,6 +85,7 @@ flags.DEFINE_float(
 # Training settings
 flags.DEFINE_integer("num_online_steps", 500_000, "Number of online training steps.")
 flags.DEFINE_integer("warmup_steps", 0, "Number of warmup steps before performing updates")
+flags.DEFINE_integer("num_envs", 1, "Number of parallel training environments")
 
 # Agent settings
 flags.DEFINE_string("agent", "sac", "RL agent to use (sac recommended for Brax)")
@@ -111,6 +119,95 @@ config_flags.DEFINE_config_file(
     "File path to the training hyperparameter configuration.",
     lock_config=False,
 )
+
+
+# ============================================================================
+# Simple Replay Buffer (no Gym dependency)
+# ============================================================================
+
+class SimpleReplayBuffer:
+    """Simple replay buffer that doesn't depend on Gym spaces."""
+    
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        capacity: int,
+        seed: int = 0,
+    ):
+        self._capacity = capacity
+        self._size = 0
+        self._insert_index = 0
+        self._rng = np.random.default_rng(seed)
+        
+        # Pre-allocate arrays
+        self._observations = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self._next_observations = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self._actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self._rewards = np.zeros((capacity,), dtype=np.float32)
+        self._masks = np.zeros((capacity,), dtype=np.float32)
+        self._dones = np.zeros((capacity,), dtype=np.float32)
+    
+    def __len__(self):
+        return self._size
+    
+    def insert(self, transition: dict):
+        """Insert a single transition."""
+        idx = self._insert_index
+        self._observations[idx] = transition["observations"]
+        self._next_observations[idx] = transition["next_observations"]
+        self._actions[idx] = transition["actions"]
+        self._rewards[idx] = transition["rewards"]
+        self._masks[idx] = transition["masks"]
+        self._dones[idx] = transition["dones"]
+        
+        self._insert_index = (self._insert_index + 1) % self._capacity
+        self._size = min(self._size + 1, self._capacity)
+    
+    def insert_batch(self, transitions: dict):
+        """Insert a batch of transitions."""
+        batch_size = len(transitions["observations"])
+        for i in range(batch_size):
+            self.insert({
+                "observations": transitions["observations"][i],
+                "next_observations": transitions["next_observations"][i],
+                "actions": transitions["actions"][i],
+                "rewards": transitions["rewards"][i],
+                "masks": transitions["masks"][i],
+                "dones": transitions["dones"][i],
+            })
+    
+    def sample(self, batch_size: int) -> dict:
+        """Sample a random batch."""
+        indices = self._rng.integers(0, self._size, size=batch_size)
+        return {
+            "observations": self._observations[indices],
+            "next_observations": self._next_observations[indices],
+            "actions": self._actions[indices],
+            "rewards": self._rewards[indices],
+            "masks": self._masks[indices],
+            "dones": self._dones[indices],
+        }
+
+
+# ============================================================================
+# Brax Environment Helper
+# ============================================================================
+
+def make_brax_training_env(
+    env_name: str,
+    backend: str = "generalized",
+    episode_length: int = 1000,
+    num_envs: int = 1,
+):
+    """Create a Brax environment wrapped for training."""
+    base_env = brax_envs.get_environment(env_name=env_name, backend=backend)
+    wrapped_env = brax_envs.training.wrap(
+        base_env,
+        episode_length=episode_length,
+        action_repeat=1,
+    )
+    return base_env, wrapped_env
 
 
 def main(_):
@@ -151,40 +248,21 @@ def main(_):
     ckpt_manager = ocp.CheckpointManager(save_dir, options=checkpoint_options)
 
     """
-    Create Brax environments
+    Create Brax environments (pure Brax, no Gym wrapper)
     """
     logging.info(f"Creating Brax environment: {FLAGS.brax_env} with backend {FLAGS.brax_backend}")
     
-    # Import brax for base environment (needed for native evaluation)
-    from brax import envs as brax_envs
-    
-    # Keep reference to base Brax env for native evaluation
-    brax_base_env = brax_envs.get_environment(
-        env_name=FLAGS.brax_env, 
-        backend=FLAGS.brax_backend
-    )
-    
-    # Create Gym-wrapped Brax environments
-    finetune_env = make_brax_env(
+    # Create base env (for native evaluation) and wrapped env (for training)
+    brax_base_env, brax_train_env = make_brax_training_env(
         env_name=FLAGS.brax_env,
         backend=FLAGS.brax_backend,
         episode_length=FLAGS.brax_episode_length,
-        reward_scale=FLAGS.reward_scale,
-        reward_bias=FLAGS.reward_bias,
-        scale_and_clip_action=True,
-        action_clip_lim=FLAGS.clip_action,
-        seed=FLAGS.seed,
+        num_envs=FLAGS.num_envs,
     )
-    eval_env = make_brax_env(
-        env_name=FLAGS.brax_env,
-        backend=FLAGS.brax_backend,
-        episode_length=FLAGS.brax_episode_length,
-        reward_scale=1.0,  # No scaling for evaluation
-        reward_bias=0.0,
-        scale_and_clip_action=True,
-        action_clip_lim=FLAGS.clip_action,
-        seed=FLAGS.seed + 1000,
-    )
+    
+    obs_dim = brax_base_env.observation_size
+    action_dim = brax_base_env.action_size
+    logging.info(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
 
     """
     Create dummy dataset for agent initialization
@@ -198,11 +276,11 @@ def main(_):
     )
 
     """
-    Replay buffer
+    Replay buffer (simple, no Gym dependency)
     """
-    replay_buffer = ReplayBuffer(
-        finetune_env.observation_space,
-        finetune_env.action_space,
+    replay_buffer = SimpleReplayBuffer(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
         capacity=FLAGS.replay_buffer_capacity,
         seed=FLAGS.seed,
     )
@@ -219,12 +297,27 @@ def main(_):
     FLAGS.config.agent_kwargs.critic_network_kwargs.hidden_dims = brax_hidden_dims
     logging.info(f"Using hidden dims {brax_hidden_dims} for policy")
     
-    agent = agents[FLAGS.agent].create(
+    agent = agents[FLAGS.agent].create_brax_compatible(
         rng=construct_rng,
         observations=example_batch["observations"],
         actions=example_batch["actions"],
-        encoder_def=None,
-        **FLAGS.config.agent_kwargs,
+        critic_network_kwargs=FLAGS.config.agent_kwargs.get('critic_network_kwargs', {
+            "hidden_dims": brax_hidden_dims,
+        }),
+        policy_network_kwargs=FLAGS.config.agent_kwargs.get('policy_network_kwargs', {
+            "hidden_dims": brax_hidden_dims,
+        }),
+        policy_kwargs=FLAGS.config.agent_kwargs.get('policy_kwargs', {
+            "tanh_squash_distribution": True,
+            "std_parameterization": "exp",
+        }),
+        critic_ensemble_size=FLAGS.config.agent_kwargs.get('critic_ensemble_size', 2),
+        critic_subsample_size=FLAGS.config.agent_kwargs.get('critic_subsample_size', None),
+        temperature_init=FLAGS.config.agent_kwargs.get('temperature_init', 1.0),
+        **{k: v for k, v in FLAGS.config.agent_kwargs.items() 
+            if k not in ['critic_network_kwargs', 'policy_network_kwargs', 
+                        'policy_kwargs', 'critic_ensemble_size', 
+                        'critic_subsample_size', 'temperature_init']},
     )
 
     # Load wsrl checkpoint if specified
@@ -242,7 +335,6 @@ def main(_):
     """
     brax_normalizer = None
     brax_normalizer_params = None
-    brax_policy_params = None
     brax_q_network_params = None
     
     if FLAGS.brax_ckpt_path != "":
@@ -252,16 +344,27 @@ def main(_):
         brax_normalizer_params, brax_policy_params, brax_eval_metrics, brax_q_network_params = load_brax_sac_checkpoint(
             FLAGS.brax_ckpt_path,
             checkpoint_idx=FLAGS.brax_ckpt_idx,
-            load_q_network=FLAGS.load_brax_q_network,
+            load_q_network=True,  # Always try to load Q-network for evaluation
         )
         
         if brax_eval_metrics is not None:
             stored_rewards = brax_eval_metrics.get('eval/episode_reward', None)
-            logging.info(f"Brax checkpoint stored return: {stored_rewards:.2f}")
+            if stored_rewards is not None:
+                logging.info(f"Brax checkpoint stored return: {stored_rewards:.2f}")
         
         # Create normalizer for observation preprocessing
         brax_normalizer = BraxNormalizer.from_brax_params(brax_normalizer_params)
         logging.info("Using Brax normalizer for observation preprocessing")
+        
+        # Load Brax policy into wsrl agent
+        logging.info("Loading Brax policy into wsrl agent's actor...")
+        agent = load_brax_policy_to_wsrl_agent(
+            agent,
+            brax_policy_params,
+            brax_normalizer_params=brax_normalizer_params,
+            absorb_normalizer=False,  # Don't absorb, we'll use normalizer separately
+        )
+        logging.info("Successfully loaded Brax policy parameters")
         
         # Load Q-network into wsrl agent if requested and available
         if FLAGS.load_brax_q_network and brax_q_network_params is not None:
@@ -281,59 +384,34 @@ def main(_):
                           "Make sure the Brax checkpoint was saved with save_q_network=True.")
 
     """
-    Evaluation function
+    Evaluation function using native Brax
     """
-    def evaluate_and_log_results(
-        eval_env,
-        policy_fn,
-        eval_func,
-        step_number,
-        wandb_logger,
-        n_eval_trajs=FLAGS.n_eval_trajs,
-    ):
-        # Wrap policy_fn to apply normalization if using Brax normalizer
-        if brax_normalizer is not None:
-            original_policy_fn = policy_fn
-            def normalized_policy_fn(obs):
-                normalized_obs = brax_normalizer(obs)
-                return original_policy_fn(normalized_obs)
-            effective_policy_fn = normalized_policy_fn
-        else:
-            effective_policy_fn = policy_fn
-
-        stats, trajs = eval_func(
-            effective_policy_fn,
-            eval_env,
-            n_eval_trajs,
+    def evaluate_and_log(step_number, wandb_logger):
+        """Run native Brax evaluation using the trained agent's policy."""
+        if brax_normalizer_params is None:
+            logging.warning("Cannot run Brax native evaluation without normalizer")
+            return {}
+        
+        # Extract policy params from agent and convert to Brax format
+        wsrl_actor_params = agent.state.params['modules_actor']
+        current_brax_policy_params = convert_wsrl_actor_to_brax_policy(wsrl_actor_params)
+        
+        brax_metrics = evaluate_brax_native(
+            brax_base_env,
+            current_brax_policy_params,
+            brax_normalizer_params,
+            hidden_layer_sizes=tuple(brax_hidden_dims),
+            seed=FLAGS.seed,
+            episode_length=FLAGS.brax_episode_length,
+            num_eval_envs=FLAGS.brax_num_eval_envs,
         )
-
+        
         eval_info = {
-            "average_return": np.mean([np.sum(t["rewards"]) for t in trajs]),
-            "average_traj_length": np.mean([len(t["rewards"]) for t in trajs]),
-            "std_return": np.std([np.sum(t["rewards"]) for t in trajs]),
-            "min_return": np.min([np.sum(t["rewards"]) for t in trajs]),
-            "max_return": np.max([np.sum(t["rewards"]) for t in trajs]),
+            "brax_native_return": brax_metrics["episode_reward"],
+            "brax_native_length": brax_metrics["episode_length"],
         }
         
-        # Run native Brax evaluation for comparison if enabled and checkpoint loaded
-        if (FLAGS.brax_native_eval and brax_base_env is not None and 
-            brax_normalizer_params is not None and brax_policy_params is not None):
-            try:
-                brax_native_metrics = evaluate_brax_native(
-                    brax_base_env,
-                    brax_policy_params,
-                    brax_normalizer_params,
-                    hidden_layer_sizes=tuple(brax_hidden_dims),
-                    seed=FLAGS.seed,
-                    episode_length=FLAGS.brax_episode_length,
-                    num_eval_envs=FLAGS.brax_num_eval_envs,
-                )
-                eval_info["brax_native_return"] = brax_native_metrics["episode_reward"]
-            except Exception as e:
-                logging.warning(f"Brax native evaluation failed: {e}")
-
         wandb_logger.log({"evaluation": eval_info}, step=step_number)
-        
         return eval_info
 
     """
@@ -341,8 +419,13 @@ def main(_):
     """
     timer = Timer()
     step = int(agent.state.step)  # 0 for new agents, or load from pre-trained
-    observation, info = finetune_env.reset()
-    done = False
+    
+    # Initialize environment state
+    rng, reset_rng = jax.random.split(rng)
+    reset_keys = jax.random.split(reset_rng, FLAGS.num_envs)
+    env_state = brax_train_env.reset(reset_keys)
+
+    env_step = jax.jit(brax_train_env.step)
 
     logging.info(f"Starting online training for {FLAGS.num_online_steps} steps")
 
@@ -355,30 +438,45 @@ def main(_):
         with timer.context("env step"):
             rng, action_rng = jax.random.split(rng)
             
+            # Get current observation (shape: [num_envs, obs_dim])
+            obs = env_state.obs
+            
             # Normalize observation for policy if using Brax normalizer
             if brax_normalizer is not None:
-                policy_obs = brax_normalizer(observation)
+                policy_obs = brax_normalizer(obs)
             else:
-                policy_obs = observation
+                policy_obs = obs
             
+            # Sample action
             action = agent.sample_actions(policy_obs, seed=action_rng)
-            next_observation, reward, done, truncated, info = finetune_env.step(action)
-
-            # Store raw observations in replay buffer (not normalized)
-            transition = dict(
-                observations=observation,
-                next_observations=next_observation,
-                actions=action,
-                rewards=reward,
-                masks=1.0 - done,
-                dones=1.0 if (done or truncated) else 0,
-            )
-            replay_buffer.insert(transition)
-
-            observation = next_observation
-            if done or truncated:
-                observation, info = finetune_env.reset()
-                done = False
+            action = jnp.clip(action, -FLAGS.clip_action, FLAGS.clip_action)
+            
+            # Step environment
+            next_env_state = env_step(env_state, action)
+            
+            # Scale reward
+            reward = next_env_state.reward * FLAGS.reward_scale + FLAGS.reward_bias
+            
+            # Store transitions in replay buffer (convert to numpy)
+            transitions = {
+                "observations": np.array(obs),
+                "next_observations": np.array(next_env_state.obs),
+                "actions": np.array(action),
+                "rewards": np.array(reward),
+                "masks": np.array(1.0 - next_env_state.done),
+                "dones": np.array(next_env_state.done),
+            }
+            
+            # Insert transitions (handles both single env and batched)
+            if FLAGS.num_envs == 1:
+                # Squeeze batch dimension for single env
+                for k, v in transitions.items():
+                    transitions[k] = v.squeeze(0) if v.ndim > 1 or (v.ndim == 1 and k in ["rewards", "masks", "dones"]) else v[0]
+                replay_buffer.insert(transitions)
+            else:
+                replay_buffer.insert_batch(transitions)
+            
+            env_state = next_env_state
 
         """
         Updates
@@ -394,8 +492,15 @@ def main(_):
                 # Normalize observations if using Brax normalizer
                 if brax_normalizer is not None:
                     batch = batch.copy()
-                    batch["observations"] = brax_normalizer(batch["observations"])
-                    batch["next_observations"] = brax_normalizer(batch["next_observations"])
+                    # Convert to JAX arrays once, then normalize (more efficient)
+                    obs = jnp.array(batch["observations"])
+                    next_obs = jnp.array(batch["next_observations"])
+                    batch["observations"] = brax_normalizer(obs)
+                    batch["next_observations"] = brax_normalizer(next_obs)
+                    # Convert other batch items to JAX if needed
+                    for key in ["actions", "rewards", "masks", "dones"]:
+                        if key in batch and not isinstance(batch[key], jnp.ndarray):
+                            batch[key] = jnp.array(batch[key])
 
                 # Update agent
                 if FLAGS.utd > 1:
@@ -418,27 +523,9 @@ def main(_):
         if step % FLAGS.eval_interval == 0 or step in eval_steps:
             logging.info("Evaluating...")
             with timer.context("evaluation"):
-                # Split rng for evaluation (so we get fresh randomness each eval)
-                rng, eval_rng = jax.random.split(rng)
-                
-                policy_fn = partial(
-                    agent.sample_actions, argmax=FLAGS.deterministic_eval
-                )
-                eval_func = partial(
-                    evaluate_with_trajectories_jit_multi_episode, 
-                    episode_length=FLAGS.brax_episode_length,
-                    rng=eval_rng,
-                    clip_action=FLAGS.clip_action
-                )
-
-                eval_info = evaluate_and_log_results(
-                    eval_env=eval_env,
-                    policy_fn=policy_fn,
-                    eval_func=eval_func,
-                    step_number=step,
-                    wandb_logger=wandb_logger,
-                )
-                logging.info(f"Step {step}: avg_return={eval_info['average_return']:.2f}")
+                eval_info = evaluate_and_log(step, wandb_logger)
+                if eval_info:
+                    logging.info(f"Step {step}: brax_return={eval_info['brax_native_return']:.2f}, brax_length={eval_info['brax_native_length']:.2f}")
 
         """
         Save Checkpoint
@@ -460,9 +547,10 @@ def main(_):
 
             wandb_logger.log({"timer": timer.get_average_times()}, step=step)
 
-    # Final save
+    # Final save and wait for checkpoint completion
     logging.info("Training complete. Saving final checkpoint...")
     ckpt_manager.save(step, args=ocp.args.StandardSave(agent))
+    ckpt_manager.wait_until_finished()
     logging.info(f"Final checkpoint saved to {save_dir}")
 
 

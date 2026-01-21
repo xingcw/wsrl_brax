@@ -15,39 +15,25 @@ else
     export LD_LIBRARY_PATH="/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH"
 fi
 
-# Default values
-BRAX_ENV=${BRAX_ENV:-"ant"}
-BRAX_EPISODE_LENGTH=${BRAX_EPISODE_LENGTH:-1000}
-BRAX_CKPT_PATH=${BRAX_CKPT_PATH:-"/home/chxing/projects/repos/learning2sim2real/checkpoints/ant_sac/20260120_002608"}  # Path to Brax SAC checkpoint (optional)
-BRAX_CKPT_IDX=${BRAX_CKPT_IDX:--1}    # Checkpoint index (-1 for latest)
-BRAX_HIDDEN_DIMS=${BRAX_HIDDEN_DIMS:-"32, 32"}  # Hidden layer sizes
-SEED=${SEED:-0}
-AGENT=${AGENT:-"sac"}
-NUM_ONLINE_STEPS=${NUM_ONLINE_STEPS:-500000}
-UTD=${UTD:-4}
-BATCH_SIZE=${BATCH_SIZE:-256}
-EVAL_INTERVAL=${EVAL_INTERVAL:-10000}
-DEBUG=${DEBUG:-"True"}  # Set to False to enable wandb logging
+CKPT_IDX=$1
 
-# Run the finetuning script
 python finetune_brax.py \
-    --brax_env="${BRAX_ENV}" \
+    --brax_env="ant" \
     --brax_backend="generalized" \
-    --brax_episode_length=${BRAX_EPISODE_LENGTH} \
-    --brax_ckpt_path="${BRAX_CKPT_PATH}" \
-    --brax_ckpt_idx=${BRAX_CKPT_IDX} \
-    --brax_hidden_dims="${BRAX_HIDDEN_DIMS}" \
-    --brax_native_eval=True \
+    --brax_episode_length=1000 \
+    --brax_ckpt_path="/home/chxing/projects/repos/learning2sim2real/checkpoints/ant_sac/20260120_002608" \
+    --brax_ckpt_idx=$CKPT_IDX \
+    --brax_hidden_dims="32, 32" \
     --brax_num_eval_envs=128 \
     --load_brax_q_network=True \
-    --agent="${AGENT}" \
-    --seed=${SEED} \
-    --num_online_steps=${NUM_ONLINE_STEPS} \
-    --utd=${UTD} \
-    --batch_size=${BATCH_SIZE} \
-    --eval_interval=${EVAL_INTERVAL} \
+    --agent="sac" \
+    --seed=0 \
+    --num_online_steps=100000 \
+    --utd=4 \
+    --batch_size=256 \
+    --eval_interval=10000 \
     --reward_scale=1.0 \
     --reward_bias=0.0 \
-    --debug=${DEBUG} \
+    --debug=False \
     --config=experiments/configs/brax_sac_config.py \
-    --exp_name="brax_${BRAX_ENV}_finetune"
+    --exp_name="brax_ant_finetune"

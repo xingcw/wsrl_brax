@@ -16,6 +16,8 @@ from wsrl.common.typing import Batch, Data, Params, PRNGKey
 from wsrl.networks.actor_critic_nets import Critic, Policy, ensemblize
 from wsrl.networks.lagrange import GeqLagrangeMultiplier
 from wsrl.networks.mlp import MLP
+from wsrl.networks.brax_actor_critic_nets import BraxPolicy, BraxCritic
+from wsrl.networks.brax_mlp import BraxMLP
 
 FLAGS = flags.FLAGS
 
@@ -599,6 +601,94 @@ class SACAgent(flax.struct.PyTreeNode):
         critic_def = partial(
             Critic,
             encoder=encoders["critic"],
+            network=critic_backbone,
+        )(name="critic")
+
+        temperature_def = GeqLagrangeMultiplier(
+            init_value=temperature_init,
+            constraint_shape=(),
+            constraint_type="geq",
+            name="temperature",
+        )
+
+        return cls._create_common(
+            rng,
+            observations,
+            actions,
+            actor_def=policy_def,
+            critic_def=critic_def,
+            temperature_def=temperature_def,
+            critic_ensemble_size=critic_ensemble_size,
+            critic_subsample_size=critic_subsample_size,
+            **kwargs,
+        )
+
+    @classmethod
+    def create_brax_compatible(
+        cls,
+        rng: PRNGKey,
+        observations: Data,
+        actions: jnp.ndarray,
+        # Model architecture
+        critic_network_kwargs: dict = {
+            "hidden_dims": [256, 256],
+        },
+        policy_network_kwargs: dict = {
+            "hidden_dims": [256, 256],
+        },
+        policy_kwargs: dict = {
+            "tanh_squash_distribution": True,
+            "std_parameterization": "exp",
+        },
+        critic_ensemble_size: int = 2,
+        critic_subsample_size: Optional[int] = None,
+        temperature_init: float = 1.0,
+        **kwargs,
+    ):
+        """
+        Create a Brax-compatible SAC agent.
+        
+        This version uses Brax-compatible network structures with:
+        - hidden_0, hidden_1, hidden_2 parameter naming
+        - No shared encoder (encoder=None for both policy and critic)
+        - BraxMLP networks that match Brax's parameter structure
+        
+        Args:
+            rng: Random key
+            observations: Example observations
+            actions: Example actions
+            critic_network_kwargs: Arguments for critic BraxMLP (hidden_dims, etc.)
+            policy_network_kwargs: Arguments for policy BraxMLP (hidden_dims, etc.)
+            policy_kwargs: Policy configuration
+            critic_ensemble_size: Number of critics in ensemble
+            critic_subsample_size: Number of critics to subsample during training
+            temperature_init: Initial temperature value
+            **kwargs: Additional arguments passed to _create_common
+            
+        Returns:
+            Brax-compatible SACAgent instance
+        """
+        # Brax doesn't use shared encoders - both are None
+        encoder_def = None
+        
+        # Define Brax-compatible networks
+        # Policy uses BraxPolicy with BraxMLP
+        policy_def = BraxPolicy(
+            encoder=None,  # No encoder for Brax
+            network=BraxMLP(**policy_network_kwargs),
+            action_dim=actions.shape[-1],
+            **policy_kwargs,
+            name="actor",
+        )
+        
+        # Critic uses BraxCritic with ensemblized BraxMLP
+        critic_backbone = partial(BraxMLP, **critic_network_kwargs)
+        critic_backbone = ensemblize(critic_backbone, critic_ensemble_size)(
+            name="critic_ensemble"
+        )
+        critic_def = partial(
+            BraxCritic,
+            encoder=None,  # No encoder for Brax
             network=critic_backbone,
         )(name="critic")
 

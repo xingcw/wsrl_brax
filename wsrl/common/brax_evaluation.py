@@ -489,7 +489,7 @@ def evaluate_brax_native(
     
     return {
         'episode_reward': float(eval_metrics['eval/episode_reward']),
-        'episode_length': float(eval_metrics.get('eval/episode_length', episode_length)),
+        'episode_length': float(eval_metrics['eval/avg_episode_length']),
     }
 
 
