@@ -62,29 +62,15 @@ def load_brax_sac_checkpoint(
             params
         )
     
-    # Check if we have stacked checkpoints by looking at normalizer mean shape
-    # Normalizer mean should be (obs_dim,) for single checkpoint or (num_ckpts, obs_dim) for stacked
-    if hasattr(normalizer_params_all, 'mean'):
-        mean_shape = np.array(normalizer_params_all.mean).shape
-        if len(mean_shape) > 1:
-            # Multiple checkpoints stacked - extract the requested one
-            normalizer_params = extract_checkpoint(normalizer_params_all, checkpoint_idx)
-            policy_params = extract_checkpoint(policy_params_all, checkpoint_idx)
-        else:
-            # Single checkpoint
-            normalizer_params = normalizer_params_all
-            policy_params = policy_params_all
+    mean_shape = np.array(normalizer_params_all.mean).shape
+    if len(mean_shape) > 1:
+        # Multiple checkpoints stacked - extract the requested one
+        normalizer_params = extract_checkpoint(normalizer_params_all, checkpoint_idx)
+        policy_params = extract_checkpoint(policy_params_all, checkpoint_idx)
     else:
-        # Fallback: check policy params
-        sample_param = jax.tree_util.tree_leaves(policy_params_all)[0]
-        if hasattr(sample_param, 'shape') and len(sample_param.shape) > 2:
-            # Multiple checkpoints stacked
-            normalizer_params = extract_checkpoint(normalizer_params_all, checkpoint_idx)
-            policy_params = extract_checkpoint(policy_params_all, checkpoint_idx)
-        else:
-            # Single checkpoint
-            normalizer_params = normalizer_params_all
-            policy_params = policy_params_all
+        # Single checkpoint
+        normalizer_params = normalizer_params_all
+        policy_params = policy_params_all
     
     # Try to load eval metrics if available
     eval_metrics = None
@@ -100,35 +86,21 @@ def load_brax_sac_checkpoint(
     q_network_params = None
     if load_q_network:
         q_params_file = os.path.join(os.path.dirname(ckpt_file), "sac_q_params.pkl")
-        if os.path.exists(q_params_file):
-            with open(q_params_file, "rb") as f:
-                q_network_data = pickle.load(f)
-            
-            # Extract q_params at the specified checkpoint index
-            q_params_all = q_network_data.get('q_params')
-            target_q_params = q_network_data.get('target_q_params')
-            
-            # Check if we have stacked checkpoints for q_params
-            if q_params_all is not None:
-                sample_q_param = jax.tree_util.tree_leaves(q_params_all)[0]
-                if hasattr(sample_q_param, 'shape') and len(sample_q_param.shape) > 2:
-                    # Multiple checkpoints stacked - extract the requested one
-                    q_params = jax.tree_util.tree_map(
-                        lambda x: x[checkpoint_idx] if isinstance(x, (np.ndarray, jnp.ndarray)) and x.ndim > 1 else x,
-                        q_params_all
-                    )
-                else:
-                    q_params = q_params_all
-            else:
-                q_params = None
-            
-            q_network_params = {
-                'q_params': q_params,
-                'target_q_params': target_q_params,
-            }
-        else:
-            logging.warning(f"Q-network params file not found at {q_params_file}. "
-                          "Make sure the checkpoint was saved with save_q_network=True.")
+        with open(q_params_file, "rb") as f:
+            q_network_data = pickle.load(f)
+        
+        # Extract q_params at the specified checkpoint index
+        q_params_all = q_network_data['q_params']
+        target_q_params = q_network_data['target_q_params']       
+        
+        q_params = extract_checkpoint(q_params_all, checkpoint_idx)
+        target_q_params = extract_checkpoint(target_q_params, checkpoint_idx)
+        
+        q_network_params = {
+            'q_params': q_params,
+            'target_q_params': target_q_params,
+        }
+        logging.info(f"Loaded Q-network params from {q_params_file} with checkpoint index {checkpoint_idx}")
     
     return normalizer_params, policy_params, eval_metrics, q_network_params
 

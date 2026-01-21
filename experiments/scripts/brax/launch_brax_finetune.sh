@@ -21,7 +21,7 @@ python finetune_brax.py \
     --brax_env="ant" \
     --brax_backend="generalized" \
     --brax_episode_length=1000 \
-    --brax_ckpt_path="/home/chxing/projects/repos/learning2sim2real/checkpoints/ant_sac/20260120_002608" \
+    --brax_ckpt_path="/home/chxing/projects/repos/learning2sim2real/checkpoints/ant_sac/20260121_003948" \
     --brax_ckpt_idx=$CKPT_IDX \
     --brax_hidden_dims="32, 32" \
     --brax_num_eval_envs=128 \

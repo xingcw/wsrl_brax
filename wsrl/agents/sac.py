@@ -681,15 +681,12 @@ class SACAgent(flax.struct.PyTreeNode):
             name="actor",
         )
         
-        # Critic uses BraxCritic with ensemblized BraxMLP
-        critic_backbone = partial(BraxMLP, **critic_network_kwargs)
-        critic_backbone = ensemblize(critic_backbone, critic_ensemble_size)(
-            name="critic_ensemble"
-        )
-        critic_def = partial(
-            BraxCritic,
-            encoder=None,  # No encoder for Brax
-            network=critic_backbone,
+        # Critic: ensemblize the entire BraxCritic (not just the backbone)
+        # This ensures hidden_2 output layer also has ensemble dimension in params
+        critic_backbone = BraxMLP(**critic_network_kwargs)
+        critic_def = ensemblize(
+            partial(BraxCritic, encoder=None, network=critic_backbone),
+            critic_ensemble_size,
         )(name="critic")
 
         temperature_def = GeqLagrangeMultiplier(

@@ -29,7 +29,7 @@ python_logging.getLogger("orbax").setLevel(python_logging.WARNING)
 
 # Also suppress absl logging for io.py messages
 import absl.logging
-absl.logging.set_verbosity(absl.logging.WARNING)
+absl.logging.set_verbosity(absl.logging.INFO)
 
 import jax
 import jax.numpy as jnp
@@ -294,19 +294,15 @@ def main(_):
     
     # Update config with Brax-specific hidden dims
     FLAGS.config.agent_kwargs.policy_network_kwargs.hidden_dims = brax_hidden_dims
-    FLAGS.config.agent_kwargs.critic_network_kwargs.hidden_dims = brax_hidden_dims
+    FLAGS.config.agent_kwargs.critic_network_kwargs.hidden_dims = (256, 256)
     logging.info(f"Using hidden dims {brax_hidden_dims} for policy")
     
     agent = agents[FLAGS.agent].create_brax_compatible(
         rng=construct_rng,
         observations=example_batch["observations"],
         actions=example_batch["actions"],
-        critic_network_kwargs=FLAGS.config.agent_kwargs.get('critic_network_kwargs', {
-            "hidden_dims": brax_hidden_dims,
-        }),
-        policy_network_kwargs=FLAGS.config.agent_kwargs.get('policy_network_kwargs', {
-            "hidden_dims": brax_hidden_dims,
-        }),
+        critic_network_kwargs=FLAGS.config.agent_kwargs['critic_network_kwargs'],
+        policy_network_kwargs=FLAGS.config.agent_kwargs['policy_network_kwargs'],
         policy_kwargs=FLAGS.config.agent_kwargs.get('policy_kwargs', {
             "tanh_squash_distribution": True,
             "std_parameterization": "exp",
@@ -369,16 +365,12 @@ def main(_):
         # Load Q-network into wsrl agent if requested and available
         if FLAGS.load_brax_q_network and brax_q_network_params is not None:
             logging.info("Loading Brax Q-network into wsrl agent's critic...")
-            try:
-                agent = load_brax_q_network_to_wsrl_agent(
-                    agent,
-                    brax_q_network_params,
-                    critic_ensemble_size=FLAGS.config.agent_kwargs.get('critic_ensemble_size', 2),
-                )
-                logging.info("Successfully loaded Brax Q-network parameters")
-            except Exception as e:
-                logging.warning(f"Failed to load Q-network parameters: {e}")
-                logging.warning("Continuing with randomly initialized critic")
+            agent = load_brax_q_network_to_wsrl_agent(
+                agent,
+                brax_q_network_params,
+                critic_ensemble_size=FLAGS.config.agent_kwargs.get('critic_ensemble_size', 2),
+            )
+            logging.info("Successfully loaded Brax Q-network parameters")
         elif FLAGS.load_brax_q_network:
             logging.warning("load_brax_q_network=True but no Q-network params found in checkpoint. "
                           "Make sure the Brax checkpoint was saved with save_q_network=True.")

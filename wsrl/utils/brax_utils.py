@@ -47,25 +47,7 @@ def load_brax_checkpoint_to_wsrl_agent(
         brax_policy = policy_params
     
     # Get current agent params
-    current_params = agent.state.params
-    
-    # Map Brax policy params to wsrl actor params
-    # Brax naming: hidden_0, hidden_1, hidden_2
-    # wsrl MLP naming: layers_0, layers_1, ... (based on hidden_dims)
-    
-    # Build mapping from Brax layer names to wsrl layer indices
-    brax_to_wsrl_mapping = {
-        'hidden_0': 'layers_0',
-        'hidden_1': 'layers_1',
-        'hidden_2': 'layers_2',  # This is the output layer (mean)
-    }
-    
-    # Note: wsrl Policy has structure: encoder -> network (MLP) -> output heads
-    # The network MLP has layers named 'layers_0', 'layers_1', etc.
-    
-    # For now, we only load the policy (actor) weights, not the critic
-    # The critic will be trained from scratch during finetuning
-    
+    current_params = agent.state.params    
     new_actor_params = _convert_brax_to_wsrl_mlp(
         brax_policy, 
         current_params['actor'],
@@ -397,51 +379,28 @@ def load_brax_q_network_to_wsrl_agent(
     """
     import copy
     
-    q_params = q_network_params.get('q_params')
-    target_q_params = q_network_params.get('target_q_params')
-    
-    if q_params is None:
-        raise ValueError("q_network_params must contain 'q_params'")
-    
-    # Extract the actual params dict
-    if 'params' in q_params:
-        brax_q = q_params['params']
-    else:
-        brax_q = q_params
+    q_params = q_network_params['q_params']['params']
+    target_q_params = q_network_params['target_q_params']['params']
     
     # Get current agent params
     current_params = copy.deepcopy(agent.state.params)
     current_target_params = copy.deepcopy(agent.state.target_params)
     
-    # Map Brax Q-network to wsrl critic
-    # Brax Q-network: hidden_0, hidden_1, hidden_2 (output)
-    # wsrl critic: critic/network/critic_ensemble/layers_0, layers_1, etc.
-    
     new_critic_params = _convert_brax_q_to_wsrl_critic(
-        brax_q,
-        current_params['critic'],
+        q_params,
+        current_params['modules_critic'],
         critic_ensemble_size,
     )
     
     # Update params
-    current_params['critic'] = new_critic_params
+    current_params['modules_critic'] = new_critic_params
     
-    # Also update target params if available
-    if target_q_params is not None:
-        if 'params' in target_q_params:
-            brax_target_q = target_q_params['params']
-        else:
-            brax_target_q = target_q_params
-        
-        new_target_critic_params = _convert_brax_q_to_wsrl_critic(
-            brax_target_q,
-            current_target_params['critic'],
-            critic_ensemble_size,
-        )
-        current_target_params['critic'] = new_target_critic_params
-    else:
-        # Use the same params for target if not provided
-        current_target_params['critic'] = new_critic_params
+    new_target_critic_params = _convert_brax_q_to_wsrl_critic(
+        target_q_params,
+        current_target_params['modules_critic'],
+        critic_ensemble_size,
+    )
+    current_target_params['modules_critic'] = new_target_critic_params
     
     # Create new state with updated params
     new_state = agent.state.replace(
@@ -481,158 +440,38 @@ def _convert_brax_q_to_wsrl_critic(
     import copy
     
     new_params = copy.deepcopy(wsrl_critic_params)
+    ensemble_params = new_params['network']
     
-    # Navigate to the network params in wsrl structure
-    # Structure: critic -> network -> critic_ensemble -> layers_X or hidden_X
-    if 'network' in new_params:
-        network_params = new_params['network']
-        if 'critic_ensemble' in network_params:
-            ensemble_params = network_params['critic_ensemble']
-        else:
-            ensemble_params = network_params
-    else:
-        ensemble_params = new_params
-    
-    # Check if using Brax-compatible structure
-    is_brax_compatible = 'hidden_0' in ensemble_params or any('hidden_' in str(k) for k in ensemble_params.keys())
-    
-    if is_brax_compatible:
-        # Brax-compatible structure: direct mapping
-        layer_mapping = [
-            ('hidden_0', 'hidden_0'),
-            ('hidden_1', 'hidden_1'),
-        ]
-        
-        for brax_name, wsrl_name in layer_mapping:
-            if brax_name in brax_q_params and wsrl_name in ensemble_params:
-                kernel = brax_q_params[brax_name]['kernel']
-                bias = brax_q_params[brax_name]['bias']
-                
-                # Keep as JAX arrays if possible, use JAX operations
-                if isinstance(kernel, jnp.ndarray):
-                    # Use JAX stack for GPU efficiency
-                    kernel_ensemble = jnp.stack([kernel] * critic_ensemble_size, axis=0)
-                    bias_ensemble = jnp.stack([bias] * critic_ensemble_size, axis=0)
-                else:
-                    # Fallback to numpy if not JAX arrays
-                    kernel = np.array(kernel)
-                    bias = np.array(bias)
-                    kernel_ensemble = np.stack([kernel] * critic_ensemble_size, axis=0)
-                    bias_ensemble = np.stack([bias] * critic_ensemble_size, axis=0)
-                    kernel_ensemble = jnp.array(kernel_ensemble)
-                    bias_ensemble = jnp.array(bias_ensemble)
-                
-                ensemble_params[wsrl_name]['kernel'] = kernel_ensemble
-                ensemble_params[wsrl_name]['bias'] = bias_ensemble
-        
-        # Handle output layer (hidden_2)
-        if 'hidden_2' in brax_q_params:
-            kernel = brax_q_params['hidden_2']['kernel']  # (hidden, 2) for Brax
-            bias = brax_q_params['hidden_2']['bias']  # (2,)
-            
-            # Convert to numpy only if needed for complex operations, then back to JAX
-            use_numpy = not isinstance(kernel, jnp.ndarray)
-            if use_numpy:
-                kernel = np.array(kernel)
-                bias = np.array(bias)
-            
-            # For wsrl, each ensemble member outputs 1 Q-value
-            # Shape should be (ensemble_size, hidden, 1)
-            if kernel.shape[-1] == 2 and critic_ensemble_size == 2:
-                # Split the 2 Q-value outputs into 2 ensemble members
-                if use_numpy:
-                    kernel_ensemble = np.transpose(kernel)[:, :, np.newaxis]  # (2, hidden, 1)
-                    bias_ensemble = bias[:, np.newaxis]  # (2, 1)
-                    kernel_ensemble = jnp.array(kernel_ensemble)
-                    bias_ensemble = jnp.array(bias_ensemble)
-                else:
-                    # Use JAX operations
-                    kernel_ensemble = jnp.transpose(kernel)[:, :, jnp.newaxis]  # (2, hidden, 1)
-                    bias_ensemble = bias[:, jnp.newaxis]  # (2, 1)
-            else:
-                # Replicate single output across ensemble
-                kernel_single = kernel[:, :1] if kernel.shape[-1] > 1 else kernel
-                bias_single = bias[:1] if bias.shape[-1] > 1 else bias
-                if use_numpy:
-                    kernel_ensemble = np.stack([kernel_single] * critic_ensemble_size, axis=0)
-                    bias_ensemble = np.stack([bias_single] * critic_ensemble_size, axis=0)
-                    kernel_ensemble = jnp.array(kernel_ensemble)
-                    bias_ensemble = jnp.array(bias_ensemble)
-                else:
-                    kernel_ensemble = jnp.stack([kernel_single] * critic_ensemble_size, axis=0)
-                    bias_ensemble = jnp.stack([bias_single] * critic_ensemble_size, axis=0)
-            
-            if 'hidden_2' in ensemble_params:
-                ensemble_params['hidden_2']['kernel'] = kernel_ensemble
-                ensemble_params['hidden_2']['bias'] = bias_ensemble
-    
-    else:
-        # Standard wsrl structure: map to layers_X
-        layer_mapping = [
-            ('hidden_0', 'layers_0'),
-            ('hidden_1', 'layers_1'),
-        ]
-        
-        for brax_name, wsrl_name in layer_mapping:
-            if brax_name in brax_q_params and wsrl_name in ensemble_params:
-                kernel = brax_q_params[brax_name]['kernel']
-                bias = brax_q_params[brax_name]['bias']
-                
-                # Use JAX operations if arrays are already JAX
-                if isinstance(kernel, jnp.ndarray):
-                    kernel_ensemble = jnp.stack([kernel] * critic_ensemble_size, axis=0)
-                    bias_ensemble = jnp.stack([bias] * critic_ensemble_size, axis=0)
-                else:
-                    kernel = np.array(kernel)
-                    bias = np.array(bias)
-                    kernel_ensemble = np.stack([kernel] * critic_ensemble_size, axis=0)
-                    bias_ensemble = np.stack([bias] * critic_ensemble_size, axis=0)
-                    kernel_ensemble = jnp.array(kernel_ensemble)
-                    bias_ensemble = jnp.array(bias_ensemble)
-                
-                ensemble_params[wsrl_name]['kernel'] = kernel_ensemble
-                ensemble_params[wsrl_name]['bias'] = bias_ensemble
-        
-        # Handle output layer (Dense_0 in wsrl)
-        if 'hidden_2' in brax_q_params:
-            kernel = brax_q_params['hidden_2']['kernel']  # (hidden, 2)
-            bias = brax_q_params['hidden_2']['bias']  # (2,)
-            
-            use_numpy = not isinstance(kernel, jnp.ndarray)
-            if use_numpy:
-                kernel = np.array(kernel)
-                bias = np.array(bias)
-            
-            if kernel.shape[-1] == 2 and critic_ensemble_size == 2:
-                if use_numpy:
-                    kernel_ensemble = np.transpose(kernel)[:, :, np.newaxis]  # (2, hidden, 1)
-                    bias_ensemble = bias[:, np.newaxis]  # (2, 1)
-                    kernel_ensemble = jnp.array(kernel_ensemble)
-                    bias_ensemble = jnp.array(bias_ensemble)
-                else:
-                    kernel_ensemble = jnp.transpose(kernel)[:, :, jnp.newaxis]  # (2, hidden, 1)
-                    bias_ensemble = bias[:, jnp.newaxis]  # (2, 1)
-            else:
-                kernel_single = kernel[:, :1] if kernel.shape[-1] > 1 else kernel
-                bias_single = bias[:1] if bias.shape[-1] > 1 else bias
-                if use_numpy:
-                    kernel_ensemble = np.stack([kernel_single] * critic_ensemble_size, axis=0)
-                    bias_ensemble = np.stack([bias_single] * critic_ensemble_size, axis=0)
-                    kernel_ensemble = jnp.array(kernel_ensemble)
-                    bias_ensemble = jnp.array(bias_ensemble)
-                else:
-                    kernel_ensemble = jnp.stack([kernel_single] * critic_ensemble_size, axis=0)
-                    bias_ensemble = jnp.stack([bias_single] * critic_ensemble_size, axis=0)
-            
-            # Find the output layer in wsrl params
-            output_layer_name = None
-            for name in ensemble_params.keys():
-                if 'Dense' in name or name == 'output' or name == 'hidden_2':
-                    output_layer_name = name
-                    break
-            
-            if output_layer_name and output_layer_name in ensemble_params:
-                ensemble_params[output_layer_name]['kernel'] = kernel_ensemble
-                ensemble_params[output_layer_name]['bias'] = bias_ensemble
-    
+    layer_mapping = [
+        ('hidden_0', 'hidden_0'),
+        ('hidden_1', 'hidden_1'),
+    ]
+    # concatenate the brax_q_params weights
+    brax_q_params_weights = {
+        'hidden_0': {'kernel': None, 'bias': None},
+        'hidden_1': {'kernel': None, 'bias': None},
+        'hidden_2': {'kernel': None, 'bias': None},
+    }
+
+    # Stack all layers with ensemble dimension (entire BraxCritic is ensemblized)
+    for brax_name in ['hidden_0', 'hidden_1', 'hidden_2']:
+        brax_q_params_weights[brax_name]['kernel'] = np.stack([
+            brax_q_params[f"MLP_{i}"][brax_name]['kernel']
+            for i in range(critic_ensemble_size)], axis=0)
+        brax_q_params_weights[brax_name]['bias'] = np.stack([
+            brax_q_params[f"MLP_{i}"][brax_name]['bias']
+            for i in range(critic_ensemble_size)], axis=0)
+
+    for brax_name, wsrl_name in layer_mapping:
+        if brax_name in brax_q_params and wsrl_name in ensemble_params:
+            ensemble_params[wsrl_name]['kernel'] = jnp.array(brax_q_params_weights[brax_name]['kernel'])
+            ensemble_params[wsrl_name]['bias'] = jnp.array(brax_q_params_weights[brax_name]['bias'])
+            print(f"Loaded {wsrl_name} to {brax_name}")
+
+    # hidden_2 also has ensemble dimension since entire BraxCritic is ensemblized
+    new_params['hidden_2'] = {
+        'kernel': jnp.array(brax_q_params_weights['hidden_2']['kernel']),
+        'bias': jnp.array(brax_q_params_weights['hidden_2']['bias'])
+    }
+
     return new_params
