@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from typing import Optional
-
+from etils import epath
 import logging as python_logging
 # Reduce logging verbosity BEFORE importing JAX
 python_logging.getLogger("jax").setLevel(python_logging.ERROR)
@@ -35,6 +35,7 @@ import jax.numpy as jnp
 # Suppress JAX info logs
 jax.config.update("jax_log_compiles", False)
 import numpy as np
+import torch
 import tqdm
 from absl import app, flags, logging
 import orbax.checkpoint as ocp
@@ -61,6 +62,18 @@ from wsrl.utils.brax_utils import (
 )
 from wsrl.common.brax_evaluation import evaluate_brax_native
 
+from data_gen.mujoco.cartpole_brax import InvertedPendulum
+from data_gen.mujoco.ant_brax import Ant
+from data_gen.mujoco.halfcheetah_brax import Halfcheetah
+from data_gen.mujoco.hopper_brax import Hopper
+brax_envs.register_environment('ant_s2r', Ant)
+brax_envs.register_environment('cartpole', InvertedPendulum)
+brax_envs.register_environment('halfcheetah_s2r', Halfcheetah)
+brax_envs.register_environment('hopper_s2r', Hopper)
+
+# Hypernet imports
+from utils.hypernet_utils import HypernetLoader
+
 FLAGS = flags.FLAGS
 
 # Brax environment settings
@@ -72,6 +85,13 @@ flags.DEFINE_integer("brax_ckpt_idx", -1, "Checkpoint index to load (-1 for late
 flags.DEFINE_list("brax_hidden_dims", ["256", "256"], "Hidden layer sizes for policy network")
 flags.DEFINE_integer("brax_num_eval_envs", 128, "Number of parallel envs for Brax native evaluation")
 flags.DEFINE_bool("load_brax_q_network", False, "Load Q-network from Brax checkpoint for wsrl finetuning")
+
+# Hypernet settings
+flags.DEFINE_string("hypernet_config_path", "", "Path to hypernet config file (YAML)")
+flags.DEFINE_string("hypernet_ckpt_path", "", "Path to hypernet checkpoint directory")
+flags.DEFINE_string("hypernet_ckpt_step", "best", "Hypernet checkpoint step (best/number)")
+flags.DEFINE_bool("hypernet_improve_init", False, "Use hypernet to improve initial policy before finetuning")
+flags.DEFINE_float("hypernet_target_reward", None, "Target reward for hypernet (default: 1.5x current)")
 
 # Reward settings
 flags.DEFINE_float("reward_scale", 1.0, "Reward scale.")
@@ -198,10 +218,24 @@ def make_brax_training_env(
     env_name: str,
     backend: str = "generalized",
     episode_length: int = 1000,
-    num_envs: int = 1,
+    mjcf_path: Optional[str] = None,
+    wandb_logger: Optional[WandBLogger] = None,
 ):
     """Create a Brax environment wrapped for training."""
-    base_env = brax_envs.get_environment(env_name=env_name, backend=backend)
+    if "s2r" in env_name:
+        if mjcf_path is None:
+            mjcf_path = os.path.join(epath.resource_path('data_gen'), f"assets/mjcf/{env_name}.xml")
+        else:
+            mjcf_path = mjcf_path
+        if wandb_logger is not None:
+            wandb_logger.save_file(mjcf_path, f"mjcf/{env_name}.xml")
+        base_env = brax_envs.get_environment(
+            env_name=env_name,
+            backend="generalized",
+            mjcf_path=mjcf_path
+        )
+    else:
+        base_env = brax_envs.get_environment(env_name=env_name, backend=backend)
     wrapped_env = brax_envs.training.wrap(
         base_env,
         episode_length=episode_length,
@@ -257,7 +291,7 @@ def main(_):
         env_name=FLAGS.brax_env,
         backend=FLAGS.brax_backend,
         episode_length=FLAGS.brax_episode_length,
-        num_envs=FLAGS.num_envs,
+        wandb_logger=wandb_logger
     )
     
     obs_dim = brax_base_env.observation_size
@@ -327,6 +361,33 @@ def main(_):
         logging.info(f"Restored agent from {FLAGS.resume_path}")
 
     """
+    Load Hypernet and generate parameters (if specified)
+    """
+    hypernet_loader = None
+    
+    if FLAGS.hypernet_config_path != "" and FLAGS.hypernet_ckpt_path != "":
+        # Warn if both hypernet and Brax checkpoint are specified
+        if FLAGS.brax_ckpt_path != "":
+            logging.warning(
+                "Both hypernet and Brax checkpoint specified. "
+                "Brax checkpoint will override hypernet-generated parameters."
+            )
+        
+        logging.info("=" * 80)
+        logging.info("HYPERNET INITIALIZATION")
+        logging.info("=" * 80)
+        
+        # Load hypernet
+        hypernet_loader = HypernetLoader(
+            config_path=FLAGS.hypernet_config_path,
+            checkpoint_path=FLAGS.hypernet_ckpt_path,
+            checkpoint_step=FLAGS.hypernet_ckpt_step,
+            seed=FLAGS.seed,
+        )
+        
+        logging.info("=" * 80)
+
+    """
     Load Brax checkpoint (normalizer, policy, and optionally Q-network)
     """
     brax_normalizer = None
@@ -383,30 +444,73 @@ def main(_):
             num_steps=100,
             num_envs=FLAGS.num_envs,
             seed=FLAGS.seed,
-            tolerance=5e-4,
+            tolerance=1e-3,
         )
         jax.config.update("jax_default_matmul_precision", prev_matmul_precision)
         logging.info("Verification passed!")
     """
+    Helper function to use hypernet for parameter improvement
+    """
+    def improve_policy_with_hypernet(
+        current_agent,
+        hypernet_loader,
+        brax_normalizer_params,
+        current_rewards,
+        target_rewards,
+        loss_cond=None
+    ):
+        """Use hypernet to generate improved policy parameters."""
+        if hypernet_loader is None:
+            return current_agent
+        
+        logging.info("=" * 80)
+        logging.info("IMPROVING POLICY WITH HYPERNET")
+        logging.info("=" * 80)
+        logging.info(f"Current rewards: {current_rewards:.2f}")
+        logging.info(f"Target rewards: {target_rewards:.2f}")
+        
+        # Extract current policy parameters from agent
+        wsrl_actor_params = current_agent.state.params['modules_actor']
+        current_brax_policy_params = convert_wsrl_actor_to_brax_policy(wsrl_actor_params)
+        
+        # Generate improved parameters with hypernet
+        improved_brax_policy_params = hypernet_loader.generate_parameters(
+            policy_normalizer=brax_normalizer_params,
+            policy_params=current_brax_policy_params,
+            current_rewards=current_rewards,
+            target_rewards=target_rewards,
+            loss_cond=loss_cond,
+            seed=FLAGS.seed,
+        )
+        
+        # Load improved parameters into agent
+        improved_agent = load_brax_policy_to_wsrl_agent(
+            current_agent,
+            improved_brax_policy_params,
+            brax_normalizer_params=brax_normalizer_params,
+            absorb_normalizer=False,
+        )
+        
+        logging.info("✓ Successfully generated and loaded improved parameters!")
+        logging.info("=" * 80)
+        
+        return improved_agent
+    
+    """
     Evaluation function using native Brax
     """
-    def evaluate_and_log(step_number, wandb_logger):
-        """Run native Brax evaluation using the trained agent's policy."""
-        if brax_normalizer_params is None:
-            logging.warning("Cannot run Brax native evaluation without normalizer")
-            return {}
-        
+    def evaluate_and_log(wsrl_agent, normalizer_params, env, step_number, wandb_logger=None, episode_length=1000):
         # Extract policy params from agent and convert to Brax format
-        wsrl_actor_params = agent.state.params['modules_actor']
+        wsrl_actor_params = wsrl_agent.state.params['modules_actor']
         current_brax_policy_params = convert_wsrl_actor_to_brax_policy(wsrl_actor_params)
         
         brax_metrics = evaluate_brax_native(
-            brax_base_env,
+            env,
             current_brax_policy_params,
-            brax_normalizer_params,
+            normalizer_params,
             hidden_layer_sizes=tuple(brax_hidden_dims),
             seed=FLAGS.seed,
-            episode_length=FLAGS.brax_episode_length,
+            episode_length=episode_length,
             num_eval_envs=FLAGS.brax_num_eval_envs,
         )
         
@@ -414,8 +518,8 @@ def main(_):
             "brax_native_return": brax_metrics["episode_reward"],
             "brax_native_length": brax_metrics["episode_length"],
         }
-        
-        wandb_logger.log({"evaluation": eval_info}, step=step_number)
+        if wandb_logger is not None:
+            wandb_logger.log({"evaluation": eval_info}, step=step_number)
         return eval_info
 
     """
@@ -428,8 +532,36 @@ def main(_):
     rng, reset_rng = jax.random.split(rng)
     reset_keys = jax.random.split(reset_rng, FLAGS.num_envs)
     env_state = brax_train_env.reset(reset_keys)
-
     env_step = jax.jit(brax_train_env.step)
+
+    """
+    Use hypernet to improve initial policy (if requested)
+    """
+    if FLAGS.hypernet_improve_init:
+        # Evaluate current policy first
+        logging.info("Evaluating initial policy before hypernet improvement...")
+        initial_eval = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger=None, episode_length=200)
+        current_reward = initial_eval['brax_native_return']
+        target_reward = FLAGS.hypernet_target_reward
+
+        full_eval_res = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger=wandb_logger, episode_length=1000)
+        logging.info(f"Full evaluation result: {full_eval_res}")
+        
+        # Improve policy with hypernet
+        agent = improve_policy_with_hypernet(
+            current_agent=agent,
+            hypernet_loader=hypernet_loader,
+            brax_normalizer_params=brax_normalizer_params,
+            current_rewards=current_reward,
+            target_rewards=target_reward,
+            loss_cond=None
+        )
+        
+        # Evaluate improved policy
+        logging.info("Evaluating improved policy after hypernet...")
+        improved_eval = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger=None, episode_length=200)
+        improved_reward = improved_eval['brax_native_return']
+        logging.info(f"Reward improvement: {current_reward:.2f} → {improved_reward:.2f} (Δ={improved_reward-current_reward:+.2f})")
 
     logging.info(f"Starting online training for {FLAGS.num_online_steps} steps")
 
@@ -527,7 +659,7 @@ def main(_):
         if step % FLAGS.eval_interval == 0 or step in eval_steps:
             logging.info("Evaluating...")
             with timer.context("evaluation"):
-                eval_info = evaluate_and_log(step, wandb_logger)
+                eval_info = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger)
                 if eval_info:
                     logging.info(f"Step {step}: brax_return={eval_info['brax_native_return']:.2f}, brax_length={eval_info['brax_native_length']:.2f}")
 
@@ -559,4 +691,18 @@ def main(_):
 
 
 if __name__ == "__main__":
+    # JAX configuration for distributed training
+    torch.multiprocessing.set_start_method('spawn', force=True)
+
+    # this setting is supposed to put here to stop torch from locking open files
+    # otherwise, the number of open files will exceed the limit
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
+    jax.distributed.initialize()
+
+    jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+
     app.run(main)

@@ -1,5 +1,7 @@
 import datetime
 import random
+import os
+import shutil
 import string
 import tempfile
 from copy import copy
@@ -111,3 +113,28 @@ class WandBLogger(object):
         data_flat = _recursive_flatten_dict(data)
         data = {k: v for k, v in zip(*data_flat)}
         wandb.log(data, step=step)
+
+    def save_file(self, local_path: str, run_path: str = None, policy: str = "now") -> str:
+        """
+        Save a local file to the current W&B run's files.
+
+        Args:
+            local_path: Path to an existing local file.
+            run_path: Destination path relative to the W&B run directory.
+                Example: "mjcf/ant_s2r.xml"
+            policy: W&B save policy ("now", "live", etc.).
+
+        Returns:
+            Absolute path to the copied file inside the run directory.
+        """
+        if run_path is None:
+            run_path = os.path.basename(local_path)
+
+        run_dir = getattr(self.run, "dir", None) or os.getcwd()
+        dst_path = os.path.join(run_dir, run_path)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy2(local_path, dst_path)
+
+        # Register the file with W&B so it gets uploaded.
+        wandb.save(dst_path, base_path=run_dir, policy=policy)
+        return dst_path
