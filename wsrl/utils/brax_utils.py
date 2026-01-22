@@ -596,6 +596,8 @@ def verify_brax_wsrl_equivalence(
     rng = jax.random.PRNGKey(seed)
     reset_keys = jax.random.split(rng, num_envs)
     env_state = wrapped_env.reset(reset_keys)
+
+    logging.info(f"Verification using dtype: {env_state.obs.dtype}")
     
     # Create wsrl policy function (with normalizer)
     brax_normalizer = BraxNormalizer.from_brax_params(brax_normalizer_params)
@@ -615,8 +617,9 @@ def verify_brax_wsrl_equivalence(
     target_q_match = True
     
     step_fn = jax.jit(wrapped_env.step)
-    
-    for step in range(num_steps):
+
+    from tqdm import tqdm
+    for step in tqdm(range(num_steps), total=num_steps, desc="Verifying Brax-wsrl equivalence"):
         obs = env_state.obs
         
         # Get actions from both policies
@@ -631,11 +634,10 @@ def verify_brax_wsrl_equivalence(
         
         if max_action_diff > tolerance:
             policy_match = False
-            if step < 10:  # Log first few mismatches
-                logging.warning(
-                    f"Step {step}: Action mismatch! Max diff: {max_action_diff:.6f}, "
-                    f"Mean diff: {jnp.mean(action_diff):.6f}"
-                )
+            logging.warning(
+                f"Step {step}: Action mismatch! Max diff: {max_action_diff:.6f}, "
+                f"Mean diff: {jnp.mean(action_diff):.6f}"
+            )
         
         brax_q = brax_q_fn(obs, brax_actions)
         wsrl_q = wsrl_q_fn(obs, brax_actions)
@@ -647,11 +649,10 @@ def verify_brax_wsrl_equivalence(
         
         if max_q_diff > tolerance:
             q_match = False
-            if step < 10:  # Log first few mismatches
-                logging.warning(
-                    f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
-                    f"Mean diff: {jnp.mean(q_diff):.6f}"
-                )
+            logging.warning(
+                f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
+                f"Mean diff: {jnp.mean(q_diff):.6f}"
+            )
         
         brax_target_q = brax_target_q_fn(obs, brax_actions)
         wsrl_target_q = wsrl_target_q_fn(obs, brax_actions)
@@ -663,11 +664,10 @@ def verify_brax_wsrl_equivalence(
         
         if max_target_q_diff > tolerance:
             target_q_match = False
-            if step < 10:  # Log first few mismatches
-                logging.warning(
-                    f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
-                    f"Mean diff: {jnp.mean(target_q_diff):.6f}"
-                )
+            logging.warning(
+                f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
+                f"Mean diff: {jnp.mean(target_q_diff):.6f}"
+            )
         
         # Step environment using Brax actions (for consistency)
         env_state = step_fn(env_state, brax_actions)

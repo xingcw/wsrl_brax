@@ -1,7 +1,3 @@
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export PYOPENGL_PLATFORM=egl
-export MUJOCO_GL=egl
-
 # env: pen-binary-v0, door-binary-v0, relocate-binary-v0
 
 python finetune.py \

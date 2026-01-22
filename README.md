@@ -31,7 +31,8 @@ pip install -r requirements.txt
 
 For jax, install
 ```
-pip install --upgrade "jax[cuda11_pip]==0.4.20" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# Install JAX for your accelerator (CPU/GPU/TPU) using the official instructions.
+# For TPU, follow the JAX TPU install guide for your platform.
 ```
 
 To use the D4RL envs, you would also need my fork of the d4rl envs below.
@@ -45,7 +46,6 @@ pip install -e .
 To use Mujoco, you would also need to install mujoco manually to `~/.mujoco/` (for more instructions on download see [here](https://github.com/openai/mujoco-py?tab=readme-ov-file#install-mujoco)), and use the following environment variables
 ```bash
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/.mujoco/mujoco210/bin
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 ```
 
 To use the adroit envs, you would need

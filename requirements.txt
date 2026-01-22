@@ -19,4 +19,4 @@ orbax-checkpoint>=0.4
 flax>=0.10
 brax
 # JAX should be installed separately:
-# pip install --upgrade "jax[cuda12]"
+# (TPU) e.g. follow JAX TPU install instructions for your platform.
