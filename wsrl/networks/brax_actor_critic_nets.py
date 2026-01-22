@@ -9,6 +9,7 @@ from typing import Optional
 import distrax
 import flax.linen as nn
 import jax.numpy as jnp
+import jax
 
 from wsrl.common.initialization import init_fns
 from wsrl.networks.brax_mlp import BraxMLP
@@ -125,15 +126,17 @@ class BraxCritic(nn.Module):
         actions: jnp.ndarray,
         train: bool = False,
     ) -> jnp.ndarray:
+        
         if self.encoder is None:
             obs_enc = observations
         else:
             obs_enc = self.encoder(observations)
-
-        inputs = jnp.concatenate([obs_enc, actions], -1)
         
-        # Forward through BraxMLP (hidden_0, hidden_1)
+        # jax.debug.print("[Brax Critic] obs_enc: {obs_enc}", obs_enc=obs_enc)
+        # jax.debug.print("[Brax Critic] actions: {actions}", actions=actions)
+        inputs = jnp.concatenate([obs_enc, actions], -1)
         outputs = self.network(inputs, train=train)
+        # jax.debug.print("[Brax Critic] outputs: {outputs}", outputs=outputs)
         
         # Q-value output layer: hidden_2 (Brax-compatible naming)
         init_fn = self.init_fn() if self.init_fn else None
@@ -147,5 +150,5 @@ class BraxCritic(nn.Module):
             value = nn.Dense(1, kernel_init=init_fn(), name="hidden_2")(outputs)
         else:
             value = nn.Dense(1, name="hidden_2")(outputs)
-
+        # jax.debug.print("[Brax Critic] value: {value}", value=value)
         return jnp.squeeze(value, -1)

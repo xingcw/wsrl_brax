@@ -83,13 +83,14 @@ class SACAgent(flax.struct.PyTreeNode):
         observations: Union[Data, Tuple[Data, Data]],
         actions: jax.Array,
         rng: PRNGKey,
+        train: bool = True,
     ) -> jax.Array:
         """
         Forward pass for target critic network.
         Pass grad_params to use non-default parameters (e.g. for gradients).
         """
         return self.forward_critic(
-            observations, actions, rng=rng, grad_params=self.state.target_params
+            observations, actions, rng=rng, grad_params=self.state.target_params, train=train
         )
 
     def forward_policy(

@@ -58,6 +58,7 @@ from wsrl.utils.brax_utils import (
     load_brax_q_network_to_wsrl_agent,
     load_brax_policy_to_wsrl_agent,
     convert_wsrl_actor_to_brax_policy,
+    verify_brax_wsrl_equivalence,
 )
 from wsrl.common.brax_evaluation import evaluate_brax_native
 
@@ -362,19 +363,28 @@ def main(_):
         )
         logging.info("Successfully loaded Brax policy parameters")
         
-        # Load Q-network into wsrl agent if requested and available
-        if FLAGS.load_brax_q_network and brax_q_network_params is not None:
-            logging.info("Loading Brax Q-network into wsrl agent's critic...")
-            agent = load_brax_q_network_to_wsrl_agent(
-                agent,
-                brax_q_network_params,
-                critic_ensemble_size=FLAGS.config.agent_kwargs.get('critic_ensemble_size', 2),
-            )
-            logging.info("Successfully loaded Brax Q-network parameters")
-        elif FLAGS.load_brax_q_network:
-            logging.warning("load_brax_q_network=True but no Q-network params found in checkpoint. "
-                          "Make sure the Brax checkpoint was saved with save_q_network=True.")
-
+        logging.info("Loading Brax Q-network into wsrl agent's critic...")
+        agent = load_brax_q_network_to_wsrl_agent(
+            agent,
+            brax_q_network_params,
+            critic_ensemble_size=FLAGS.config.agent_kwargs['critic_ensemble_size'],
+        )
+        logging.info("Successfully loaded Brax Q-network parameters")
+        
+        # Verify that loaded weights match Brax policy/Q-network exactly
+        logging.info("Verifying loaded weights match Brax policy/Q-network...")
+        _ = verify_brax_wsrl_equivalence(
+            brax_env=brax_base_env,
+            brax_policy_params=brax_policy_params,
+            brax_q_params=brax_q_network_params,
+            brax_normalizer_params=brax_normalizer_params,
+            wsrl_agent=agent,
+            num_steps=100,
+            num_envs=FLAGS.num_envs,
+            seed=FLAGS.seed,
+            tolerance=1e-4,
+        )
+        logging.info("Verification passed!")
     """
     Evaluation function using native Brax
     """

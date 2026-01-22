@@ -24,7 +24,7 @@ class BraxMLP(nn.Module):
     """
     hidden_dims: Sequence[int]
     activations: Callable[[jnp.ndarray], jnp.ndarray] | str = nn.relu
-    activate_final: bool = True
+    activate_final: bool = False
     use_layer_norm: bool = False
     dropout_rate: Optional[float] = None
     kernel_init_type: Optional[str] = None

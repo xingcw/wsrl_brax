@@ -32,7 +32,7 @@ python finetune_brax.py \
     --utd=4 \
     --batch_size=256 \
     --eval_interval=10000 \
-    --reward_scale=1.0 \
+    --reward_scale=10.0 \
     --reward_bias=0.0 \
     --debug=False \
     --config=experiments/configs/brax_sac_config.py \

@@ -3,14 +3,62 @@ Utilities for loading and converting Brax SAC checkpoints to wsrl agents.
 """
 
 from copy import deepcopy
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Callable
+import jax
 import jax.numpy as jnp
 import numpy as np
+import logging
+from wsrl.agents.sac import SACAgent
 
 from wsrl.envs.brax_dataset import (
     convert_brax_normalizer_to_dict,
     load_brax_sac_checkpoint,
 )
+
+from brax.training import types
+from brax.training.agents.sac import networks as sac_networks
+from brax.training import networks
+from brax.training.acme import running_statistics
+from brax import envs
+from flax import linen as nn
+from typing import Sequence
+from brax.training import distribution
+
+
+def make_sac_networks(
+    observation_size: int,
+    action_size: int,
+    preprocess_observations_fn: types.PreprocessObservationFn = types.identity_observation_preprocessor,
+    hidden_layer_sizes: Sequence[int] = (256, 256),
+    activation: networks.ActivationFn = nn.relu,
+    policy_network_layer_norm: bool = False,
+    q_network_layer_norm: bool = False,
+) -> sac_networks.SACNetworks:
+  """Make SAC networks."""
+  parametric_action_distribution = distribution.NormalTanhDistribution(
+      event_size=action_size
+  )
+  policy_network = networks.make_policy_network(
+      parametric_action_distribution.param_size,
+      observation_size,
+      preprocess_observations_fn=preprocess_observations_fn,
+      hidden_layer_sizes=hidden_layer_sizes,
+      activation=activation,
+      layer_norm=policy_network_layer_norm,
+  )
+  q_network = networks.make_q_network(
+      observation_size,
+      action_size,
+      preprocess_observations_fn=preprocess_observations_fn,
+      hidden_layer_sizes=(256, 256),
+      activation=activation,
+      layer_norm=q_network_layer_norm,
+  )
+  return sac_networks.SACNetworks(
+      policy_network=policy_network,
+      q_network=q_network,
+      parametric_action_distribution=parametric_action_distribution,
+  )
 
 
 def load_brax_checkpoint_to_wsrl_agent(
@@ -96,52 +144,31 @@ def _convert_brax_to_wsrl_mlp(
     """
     import copy
     
-    # Make a copy of wsrl params to modify
     new_params = copy.deepcopy(wsrl_actor_params)
     network_params = new_params['network']
     
-    # Brax-compatible structure: direct mapping
     layer_mapping = [
         ('hidden_0', 'hidden_0'),
         ('hidden_1', 'hidden_1'),
     ]
     
     for brax_name, wsrl_name in layer_mapping:
-        if brax_name in brax_params and wsrl_name in network_params:
-            # Keep as JAX arrays if they already are, avoid CPU-GPU transfers
-            kernel = brax_params[brax_name]['kernel']
-            bias = brax_params[brax_name]['bias']
-            
-            # Absorb normalizer into first layer if requested
-            if absorb_normalizer and brax_name == 'hidden_0' and normalizer_params is not None:
-                # Need numpy for normalizer absorption math
-                kernel_np = np.array(kernel)
-                bias_np = np.array(bias)
-                kernel_np, bias_np = _absorb_normalizer(kernel_np, bias_np, normalizer_params)
-                kernel = jnp.array(kernel_np)
-                bias = jnp.array(bias_np)
-            else:
-                # Ensure JAX arrays (convert only if not already JAX)
-                if not isinstance(kernel, jnp.ndarray):
-                    kernel = jnp.array(kernel)
-                if not isinstance(bias, jnp.ndarray):
-                    bias = jnp.array(bias)
-            
-            network_params[wsrl_name]['kernel'] = kernel
-            network_params[wsrl_name]['bias'] = bias
+        kernel = brax_params[brax_name]['kernel']
+        bias = brax_params[brax_name]['bias']
+        
+        if absorb_normalizer and brax_name == 'hidden_0' and normalizer_params is not None:
+            kernel, bias = _absorb_normalizer(kernel, bias, normalizer_params)
+
+        network_params[wsrl_name]['kernel'] = jnp.array(kernel)
+        network_params[wsrl_name]['bias'] = jnp.array(bias)
+        logging.info(f"[Brax to wsrl] Loaded {wsrl_name} to {brax_name}")
     
-    # Handle output layer (hidden_2 for mean)
     if 'hidden_2' in brax_params:
-        if 'hidden_2' in new_params:
-            # Keep as JAX arrays, avoid unnecessary conversions
-            kernel = brax_params['hidden_2']['kernel']
-            bias = brax_params['hidden_2']['bias']
-            if not isinstance(kernel, jnp.ndarray):
-                kernel = jnp.array(kernel)
-            if not isinstance(bias, jnp.ndarray):
-                bias = jnp.array(bias)
-            new_params['hidden_2']['kernel'] = kernel
-            new_params['hidden_2']['bias'] = bias
+        kernel = brax_params['hidden_2']['kernel']
+        bias = brax_params['hidden_2']['bias']
+        new_params['hidden_2']['kernel'] = jnp.array(kernel)
+        new_params['hidden_2']['bias'] = jnp.array(bias)
+        logging.info(f"[Brax to wsrl] Loaded hidden_2")
     
     return new_params
 
@@ -320,35 +347,22 @@ def convert_wsrl_actor_to_brax_policy(
     ]
     
     for wsrl_name, brax_name in layer_mapping:
-        if wsrl_name in network_params:
-            # Convert to numpy for Brax format (this is only for saving/evaluation, so CPU is fine)
-            kernel = network_params[wsrl_name]['kernel']
-            bias = network_params[wsrl_name]['bias']
-            # Only convert to numpy if needed (for pickle/saving)
-            if isinstance(kernel, jnp.ndarray):
-                kernel = np.array(kernel)
-            if isinstance(bias, jnp.ndarray):
-                bias = np.array(bias)
-            brax_params[brax_name] = {
-                'kernel': kernel,
-                'bias': bias,
-            }
+        # Convert to numpy for Brax format (this is only for saving/evaluation, so CPU is fine)
+        brax_params[brax_name] = {
+            'kernel': np.array(network_params[wsrl_name]['kernel']),
+            'bias': np.array(network_params[wsrl_name]['bias']),
+        }
+        logging.info(f"[wsrl to Brax] Loaded {wsrl_name} to {brax_name}")
     
     # Handle output layer (hidden_2)
     if 'hidden_2' in wsrl_actor_params:
         output_layer = wsrl_actor_params['hidden_2']
-        kernel = output_layer['kernel']
-        bias = output_layer['bias']
-        # Convert to numpy for Brax format
-        if isinstance(kernel, jnp.ndarray):
-            kernel = np.array(kernel)
-        if isinstance(bias, jnp.ndarray):
-            bias = np.array(bias)
         brax_params['hidden_2'] = {
-            'kernel': kernel,
-            'bias': bias,
+            'kernel': np.array(output_layer['kernel']),
+            'bias': np.array(output_layer['bias']),
         }
-
+        logging.info(f"[wsrl to Brax] Loaded hidden_2")
+    
     brax_policy_params = {
         "params": brax_params
     }
@@ -463,15 +477,220 @@ def _convert_brax_q_to_wsrl_critic(
             for i in range(critic_ensemble_size)], axis=0)
 
     for brax_name, wsrl_name in layer_mapping:
-        if brax_name in brax_q_params and wsrl_name in ensemble_params:
-            ensemble_params[wsrl_name]['kernel'] = jnp.array(brax_q_params_weights[brax_name]['kernel'])
-            ensemble_params[wsrl_name]['bias'] = jnp.array(brax_q_params_weights[brax_name]['bias'])
-            print(f"Loaded {wsrl_name} to {brax_name}")
+        ensemble_params[wsrl_name]['kernel'] = jnp.array(brax_q_params_weights[brax_name]['kernel'])
+        ensemble_params[wsrl_name]['bias'] = jnp.array(brax_q_params_weights[brax_name]['bias'])
+        logging.info(f"[Brax to wsrl] Loaded {wsrl_name} to {brax_name}")
 
     # hidden_2 also has ensemble dimension since entire BraxCritic is ensemblized
     new_params['hidden_2'] = {
         'kernel': jnp.array(brax_q_params_weights['hidden_2']['kernel']),
         'bias': jnp.array(brax_q_params_weights['hidden_2']['bias'])
     }
-
+    logging.info(f"[Brax to wsrl] Loaded hidden_2")
     return new_params
+
+
+def verify_brax_wsrl_equivalence(
+    brax_env,
+    brax_policy_params: Dict[str, Any],
+    brax_q_params: Dict[str, Any],
+    brax_normalizer_params: Any,
+    wsrl_agent: Any,
+    num_steps: int = 100,
+    num_envs: int = 1,
+    seed: int = 0,
+    tolerance: float = 1e-5,
+) -> Dict[str, Any]:
+    """
+    Verify that wsrl agent performs exactly the same as Brax policy/Q-network.
+    
+    This function collects trajectories step-by-step using the same Brax environment
+    state for both policies, comparing actions and Q-values at each step.
+    
+    Args:
+        brax_env: Brax environment (base, not wrapped)
+        brax_policy_params: Brax policy parameters dict
+        brax_q_params: Brax Q-network parameters dict (with 'q_params' key) - REQUIRED
+        brax_normalizer_params: Brax normalizer parameters
+        wsrl_agent: wsrl SACAgent instance (with loaded Brax weights)
+        num_steps: Number of steps to compare
+        num_envs: Number of parallel environments
+        seed: Random seed
+        tolerance: Tolerance for numerical differences
+        
+    Returns:
+        Dictionary with verification results:
+        - 'policy_match': bool, whether actions match
+        - 'q_match': bool, whether Q-values match
+        - 'action_diffs': list of action differences per step
+        - 'q_diffs': list of Q-value differences per step
+        - 'max_action_diff': float, maximum action difference
+        - 'max_q_diff': float, maximum Q-value difference
+    """
+    
+    # Create Brax SAC networks
+    obs_size = brax_env.observation_size
+    action_size = brax_env.action_size
+
+    wsrl_agent: SACAgent
+    
+    actor_params = wsrl_agent.state.params['modules_actor']
+    network_params = actor_params['network']
+    hidden_dims = [network_params['hidden_0']['kernel'].shape[-1], network_params['hidden_1']['kernel'].shape[-1]]
+    
+    normalize_fn = running_statistics.normalize
+    sac_network = make_sac_networks(
+        observation_size=obs_size,
+        action_size=action_size,
+        preprocess_observations_fn=normalize_fn,
+        hidden_layer_sizes=hidden_dims,
+        activation=nn.relu
+    )
+    
+    # Create Brax policy inference function
+    make_policy = sac_networks.make_inference_fn(sac_network)
+    brax_policy_fn = make_policy((brax_normalizer_params, brax_policy_params), deterministic=True)
+    
+    q_params = brax_q_params['q_params']
+    target_q_params = brax_q_params['target_q_params']
+    
+    def brax_q_fn(obs, actions):
+        """Get Q-values from Brax Q-network."""
+        q_values = sac_network.q_network.apply(brax_normalizer_params, q_params, obs, actions)
+        # Brax Q-network outputs 2 Q-values (Q1, Q2), take min
+        if q_values.ndim > 1 and q_values.shape[-1] == 2:
+            q_values = jnp.min(q_values, axis=-1)
+        return q_values
+    
+    def wsrl_q_fn(obs, actions):
+        """Get Q-values from wsrl agent's critic."""
+        normalized_obs = brax_normalizer(obs)
+        q_values = wsrl_agent.forward_critic(normalized_obs, actions, rng=None, train=False)
+        if q_values.ndim > 1:
+            q_values = jnp.min(q_values, axis=0)
+        return q_values
+
+    def brax_target_q_fn(obs, actions):
+        """Get target Q-values from Brax Q-network."""
+        q_values = sac_network.q_network.apply(brax_normalizer_params, target_q_params, obs, actions)
+        if q_values.ndim > 1 and q_values.shape[-1] == 2:
+            q_values = jnp.min(q_values, axis=-1)
+        return q_values
+
+    def wsrl_target_q_fn(obs, actions):
+        """Get target Q-values from wsrl agent's critic."""
+        normalized_obs = brax_normalizer(obs)
+        q_values = wsrl_agent.forward_target_critic(normalized_obs, actions, rng=None, train=False)
+        if q_values.ndim > 1:
+            q_values = jnp.min(q_values, axis=0)
+        return q_values
+    
+    # Wrap environment for training
+    wrapped_env = envs.training.wrap(
+        brax_env,
+        episode_length=1000,
+        action_repeat=1,
+    )
+    
+    # Initialize environment
+    rng = jax.random.PRNGKey(seed)
+    reset_keys = jax.random.split(rng, num_envs)
+    env_state = wrapped_env.reset(reset_keys)
+    
+    # Create wsrl policy function (with normalizer)
+    brax_normalizer = BraxNormalizer.from_brax_params(brax_normalizer_params)
+    
+    def wsrl_policy_fn(obs, key):
+        """Get actions from wsrl agent."""
+        normalized_obs = brax_normalizer(obs)
+        actions = wsrl_agent.sample_actions(normalized_obs, argmax=True)
+        return actions, {}
+    
+    # Collect step-by-step comparisons
+    action_diffs = []
+    q_diffs = []
+    target_q_diffs = []
+    policy_match = True
+    q_match = True
+    target_q_match = True
+    
+    step_fn = jax.jit(wrapped_env.step)
+    
+    for step in range(num_steps):
+        obs = env_state.obs
+        
+        # Get actions from both policies
+        rng, brax_key, wsrl_key = jax.random.split(rng, 3)
+        brax_actions, _ = brax_policy_fn(obs, brax_key)
+        wsrl_actions, _ = wsrl_policy_fn(obs, wsrl_key)
+        
+        # Compare actions
+        action_diff = jnp.abs(brax_actions - wsrl_actions)
+        max_action_diff = jnp.max(action_diff)
+        action_diffs.append(float(max_action_diff))
+        
+        if max_action_diff > tolerance:
+            policy_match = False
+            if step < 10:  # Log first few mismatches
+                logging.warning(
+                    f"Step {step}: Action mismatch! Max diff: {max_action_diff:.6f}, "
+                    f"Mean diff: {jnp.mean(action_diff):.6f}"
+                )
+        
+        brax_q = brax_q_fn(obs, brax_actions)
+        wsrl_q = wsrl_q_fn(obs, brax_actions)
+        
+        # Compare Q-values
+        q_diff = jnp.abs(brax_q - wsrl_q)
+        max_q_diff = jnp.max(q_diff)
+        q_diffs.append(float(max_q_diff))
+        
+        if max_q_diff > tolerance:
+            q_match = False
+            if step < 10:  # Log first few mismatches
+                logging.warning(
+                    f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
+                    f"Mean diff: {jnp.mean(q_diff):.6f}"
+                )
+        
+        brax_target_q = brax_target_q_fn(obs, brax_actions)
+        wsrl_target_q = wsrl_target_q_fn(obs, brax_actions)
+        
+        # Compare target Q-values
+        target_q_diff = jnp.abs(brax_target_q - wsrl_target_q)
+        max_target_q_diff = jnp.max(target_q_diff)
+        target_q_diffs.append(float(max_target_q_diff))
+        
+        if max_target_q_diff > tolerance:
+            target_q_match = False
+            if step < 10:  # Log first few mismatches
+                logging.warning(
+                    f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
+                    f"Mean diff: {jnp.mean(target_q_diff):.6f}"
+                )
+        
+        # Step environment using Brax actions (for consistency)
+        env_state = step_fn(env_state, brax_actions)
+
+        if not policy_match or not q_match or not target_q_match:
+            raise ValueError("Verification failed")
+    
+    results = {
+        'policy_match': policy_match,
+        'q_match': q_match,
+        'action_diffs': action_diffs,
+        'q_diffs': q_diffs,
+        'max_action_diff': max(action_diffs) if action_diffs else 0.0,
+        'max_q_diff': max(q_diffs) if q_diffs else 0.0,
+        'mean_action_diff': np.mean(action_diffs) if action_diffs else 0.0,
+        'mean_q_diff': np.mean(q_diffs) if q_diffs else 0.0,
+        'max_target_q_diff': max(target_q_diffs) if target_q_diffs else 0.0,
+        'mean_target_q_diff': np.mean(target_q_diffs) if target_q_diffs else 0.0,
+    }
+    
+    logging.info(f"Verification complete:")
+    logging.info(f"  Policy match: {policy_match} (max diff: {results['max_action_diff']:.6f})")
+    logging.info(f"  Q-network match: {q_match} (max diff: {results['max_q_diff']:.6f})")
+    logging.info(f"  Target Q-network match: {target_q_match} (max diff: {results['max_target_q_diff']:.6f})")
+    
+    return results

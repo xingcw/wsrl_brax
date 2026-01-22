@@ -3,6 +3,7 @@ from typing import Optional
 import distrax
 import flax.linen as nn
 import jax.numpy as jnp
+import jax
 
 from wsrl.common.initialization import init_fns
 
