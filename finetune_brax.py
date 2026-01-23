@@ -7,6 +7,7 @@ in the train_sac_brax.py script.
 """
 
 import os
+import shutil
 import warnings
 
 # Suppress noisy runtime logs before importing JAX
@@ -123,9 +124,11 @@ flags.DEFINE_string(
     "Directory to save the logs and checkpoints",
 )
 flags.DEFINE_string("resume_path", "", "Path to resume from (wsrl checkpoint)")
+flags.DEFINE_string("checkpoint_dir", "", "Directory for preemption-safe checkpoints (supports GCS, e.g., gs://bucket/path). Auto-resumes if checkpoint exists.")
 flags.DEFINE_integer("log_interval", 5_000, "Log every n steps")
 flags.DEFINE_integer("eval_interval", 20_000, "Evaluate every n steps")
 flags.DEFINE_integer("save_interval", 100_000, "Save every n steps.")
+flags.DEFINE_integer("checkpoint_interval", 10_000, "Save preemption-safe checkpoint every n steps (for auto-resume)")
 flags.DEFINE_integer("n_eval_trajs", 20, "Number of trajectories for evaluation.")
 flags.DEFINE_bool("deterministic_eval", True, "Whether to use deterministic evaluation")
 
@@ -246,6 +249,109 @@ def make_brax_training_env(
     return base_env, wrapped_env
 
 
+# ============================================================================
+# Checkpoint Management (GCS-compatible)
+# ============================================================================
+
+def load_preemption_checkpoint(checkpoint_dir: str):
+    """Load checkpoint from GCS or local path if it exists.
+    
+    Returns:
+        tuple: (agent_state, step, wandb_run_id) or (None, 0, None) if no checkpoint
+    """
+    if not checkpoint_dir:
+        return None, 0, None
+    
+    ckpt_path = epath.Path(checkpoint_dir)
+    
+    try:
+        checkpointer = ocp.PyTreeCheckpointer()
+        latest_step = checkpointer.latest_step(ckpt_path)
+        
+        if latest_step is not None:
+            logging.info(f"🔄 Found checkpoint at step {latest_step}")
+            restored = checkpointer.restore(ckpt_path / str(latest_step))
+            
+            agent_state = restored.get('agent', None)
+            step = restored.get('step', latest_step)
+            wandb_run_id = restored.get('wandb_run_id', None)
+            replay_buffer_state = restored.get('replay_buffer', None)
+            
+            logging.info(f"✓ Successfully restored checkpoint from step {step}")
+            if wandb_run_id:
+                logging.info(f"✓ Found wandb run ID: {wandb_run_id}")
+            
+            return agent_state, int(step), wandb_run_id, replay_buffer_state
+        else:
+            logging.info(f"🆕 No checkpoint found in {checkpoint_dir}")
+            return None, 0, None, None
+    except Exception as e:
+        logging.warning(f"⚠️  Failed to load checkpoint: {e}")
+        return None, 0, None, None
+
+
+def save_preemption_checkpoint(checkpoint_dir: str, agent, step: int, wandb_run_id: str, replay_buffer=None):
+    """Save checkpoint to GCS or local path for preemption recovery.
+    
+    Args:
+        checkpoint_dir: Path to save checkpoint (supports GCS)
+        agent: The agent to save
+        step: Current training step
+        wandb_run_id: Wandb run ID for resume
+        replay_buffer: Optional replay buffer to save
+    """
+    if not checkpoint_dir:
+        return
+    
+    ckpt_path = epath.Path(checkpoint_dir)
+    
+    try:
+        # Prepare checkpoint data
+        ckpt_data = {
+            'agent': agent,
+            'step': step,
+            'wandb_run_id': wandb_run_id,
+        }
+        
+        # Optionally include replay buffer (can be large)
+        if replay_buffer is not None:
+            try:
+                ckpt_data['replay_buffer'] = {
+                    'observations': replay_buffer._observations[:replay_buffer._size],
+                    'next_observations': replay_buffer._next_observations[:replay_buffer._size],
+                    'actions': replay_buffer._actions[:replay_buffer._size],
+                    'rewards': replay_buffer._rewards[:replay_buffer._size],
+                    'masks': replay_buffer._masks[:replay_buffer._size],
+                    'dones': replay_buffer._dones[:replay_buffer._size],
+                    'size': replay_buffer._size,
+                    'insert_index': replay_buffer._insert_index,
+                }
+            except Exception as e:
+                logging.warning(f"⚠️  Failed to save replay buffer: {e}")
+        
+        checkpointer = ocp.PyTreeCheckpointer()
+        checkpointer.save(
+            ckpt_path / str(step),
+            ckpt_data,
+            force=True
+        )
+        
+        # Clean up old checkpoints (keep only latest 3)
+        try:
+            all_steps = [int(p.name) for p in ckpt_path.iterdir() if p.name.isdigit()]
+            if len(all_steps) > 3:
+                all_steps.sort()
+                for old_step in all_steps[:-3]:  # Keep only last 3
+                    old_path = ckpt_path / str(old_step)
+                    if old_path.exists():
+                        ocp.utils.rmtree(old_path)
+        except Exception as e:
+            logging.warning(f"⚠️  Failed to clean up old checkpoints: {e}")
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to save checkpoint: {e}")
+
+
 def main(_):
     """
     House keeping
@@ -279,6 +385,25 @@ def main(_):
     # Minimum steps before updates (need some data in buffer)
     min_steps_to_update = FLAGS.batch_size
 
+    """
+    Try to load checkpoint for resumption (if checkpoint_dir is provided)
+    """
+    resumed_agent_state = None
+    resumed_step = 0
+    resumed_wandb_run_id = None
+    resumed_replay_buffer_state = None
+    
+    if FLAGS.checkpoint_dir:
+        logging.info("=" * 80)
+        logging.info("CHECKING FOR EXISTING CHECKPOINT")
+        logging.info("=" * 80)
+        resumed_agent_state, resumed_step, resumed_wandb_run_id, resumed_replay_buffer_state = load_preemption_checkpoint(
+            FLAGS.checkpoint_dir
+        )
+        if resumed_agent_state is not None:
+            logging.info(f"✓ Will resume from step {resumed_step}")
+        logging.info("=" * 80)
+    
     """
     Wandb and logging
     """
@@ -331,6 +456,7 @@ def main(_):
             "tags": [f"seed_{FLAGS.seed}", FLAGS.brax_env, FLAGS.agent],  # Add tags for easy filtering
         }
     )
+    
     # Add FLAGS to variant for full tracking
     variant = FLAGS.config.to_dict()
     variant.update({
@@ -342,12 +468,70 @@ def main(_):
         "utd": FLAGS.utd,
     })
     
-    wandb_logger = WandBLogger(
-        wandb_config=wandb_config,
-        variant=variant,
-        random_str_in_identifier=True,
-        disable_online_logging=FLAGS.debug,
-    )
+    # If resuming, use the saved run ID to continue the same wandb run
+    if resumed_wandb_run_id:
+        logging.info(f"🔄 Resuming wandb run: {resumed_wandb_run_id}")
+        # Override the experiment_id to use the resumed ID
+        wandb_config.update({
+            "unique_identifier": "",  # Will be set to resumed ID
+            "experiment_id": resumed_wandb_run_id,
+        })
+        
+        # We need to initialize wandb manually for resume
+        import wandb
+        wandb_output_dir = os.path.expanduser("~/wandb_logs")
+        os.makedirs(wandb_output_dir, exist_ok=True)
+        
+        wandb.init(
+            config=variant,
+            project=wandb_config['project'],
+            entity=wandb_config.get('entity', None),
+            group=wandb_config['group'],
+            dir=wandb_output_dir,
+            id=resumed_wandb_run_id,
+            resume="must",
+            save_code=True,
+            mode="disabled" if FLAGS.debug else "online",
+        )
+        
+        # Create a simple wrapper to match WandBLogger interface
+        class ResumedWandBLogger:
+            def __init__(self, run, config):
+                self.run = run
+                self.config = ml_collections.ConfigDict(config)
+                
+            def log(self, data: dict, step: int = None):
+                from wsrl.common.wandb import _recursive_flatten_dict
+                data_flat = _recursive_flatten_dict(data)
+                data = {k: v for k, v in zip(*data_flat)}
+                wandb.log(data, step=step)
+            
+            def save_file(self, local_path: str, run_path: str = None, policy: str = "now"):
+                if run_path is None:
+                    run_path = os.path.basename(local_path)
+                run_dir = self.run.dir or os.getcwd()
+                dst_path = os.path.join(run_dir, run_path)
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                shutil.copy2(local_path, dst_path)
+                wandb.save(dst_path, base_path=run_dir, policy=policy)
+                return dst_path
+        
+        wandb_logger = ResumedWandBLogger(wandb.run, wandb_config)
+    else:
+        wandb_logger = WandBLogger(
+            wandb_config=wandb_config,
+            variant=variant,
+            random_str_in_identifier=True,
+            disable_online_logging=FLAGS.debug,
+        )
+    
+    # Save wandb run ID for future resumption
+    current_wandb_run_id = None
+    if hasattr(wandb_logger, 'run') and wandb_logger.run is not None:
+        current_wandb_run_id = wandb_logger.run.id
+        logging.info(f"Wandb run ID: {current_wandb_run_id}")
+    else:
+        logging.warning("Could not get wandb run ID")
     
     logging.info("=" * 80)
     logging.info(f"EXPERIMENT CONFIGURATION")
@@ -356,6 +540,11 @@ def main(_):
     logging.info(f"Group: {final_group}")
     logging.info(f"Run Name: {exp_descriptor}")
     logging.info(f"Seed: {FLAGS.seed}")
+    if FLAGS.checkpoint_dir:
+        logging.info(f"Preemption Checkpoint: {FLAGS.checkpoint_dir}")
+        logging.info(f"Checkpoint Interval: {FLAGS.checkpoint_interval} steps")
+        if resumed_step > 0:
+            logging.info(f"Resuming from: Step {resumed_step}")
     logging.info("=" * 80)
 
     save_dir = os.path.join(
@@ -406,6 +595,23 @@ def main(_):
         capacity=FLAGS.replay_buffer_capacity,
         seed=FLAGS.seed,
     )
+    
+    # Restore replay buffer from checkpoint if available
+    if resumed_replay_buffer_state is not None:
+        logging.info("🔄 Restoring replay buffer from checkpoint...")
+        try:
+            buffer_size = resumed_replay_buffer_state['size']
+            replay_buffer._observations[:buffer_size] = resumed_replay_buffer_state['observations']
+            replay_buffer._next_observations[:buffer_size] = resumed_replay_buffer_state['next_observations']
+            replay_buffer._actions[:buffer_size] = resumed_replay_buffer_state['actions']
+            replay_buffer._rewards[:buffer_size] = resumed_replay_buffer_state['rewards']
+            replay_buffer._masks[:buffer_size] = resumed_replay_buffer_state['masks']
+            replay_buffer._dones[:buffer_size] = resumed_replay_buffer_state['dones']
+            replay_buffer._size = buffer_size
+            replay_buffer._insert_index = resumed_replay_buffer_state['insert_index']
+            logging.info(f"✓ Replay buffer restored with {buffer_size} transitions")
+        except Exception as e:
+            logging.warning(f"⚠️  Failed to restore replay buffer: {e}. Starting with empty buffer.")
 
     """
     Initialize agent
@@ -438,7 +644,7 @@ def main(_):
                         'critic_subsample_size', 'temperature_init']},
     )
 
-    # Load wsrl checkpoint if specified
+    # Load wsrl checkpoint if specified (for transfer learning, not resumption)
     if FLAGS.resume_path != "":
         assert os.path.exists(FLAGS.resume_path), "resume path does not exist"
         restore_path = os.path.join(FLAGS.resume_path, "default")
@@ -447,6 +653,12 @@ def main(_):
         else:
             agent = ocp.StandardCheckpointer().restore(FLAGS.resume_path, target=agent)
         logging.info(f"Restored agent from {FLAGS.resume_path}")
+    
+    # Restore from preemption checkpoint if it exists (overrides resume_path)
+    if resumed_agent_state is not None:
+        logging.info("🔄 Restoring agent state from preemption checkpoint...")
+        agent = resumed_agent_state
+        logging.info(f"✓ Agent restored from step {resumed_step}")
 
     """
     Load Hypernet and generate parameters (if specified)
@@ -621,7 +833,13 @@ def main(_):
     Training loop
     """
     timer = Timer()
-    step = int(agent.state.step)  # 0 for new agents, or load from pre-trained
+    
+    # Start from resumed step if available, otherwise from agent's step
+    if resumed_step > 0:
+        step = resumed_step
+        logging.info(f"🔄 Resuming training from step {step}")
+    else:
+        step = int(agent.state.step)  # 0 for new agents, or load from pre-trained
     
     # Initialize environment state
     rng, reset_rng = jax.random.split(rng)
@@ -788,6 +1006,18 @@ def main(_):
             logging.info("Saving checkpoint...")
             ckpt_manager.save(step, args=ocp.args.StandardSave(agent))
             logging.info(f"Saved checkpoint at step {step} to {save_dir}")
+        
+        """
+        Save Preemption-Safe Checkpoint (for auto-resume after TPU preemption)
+        """
+        if FLAGS.checkpoint_dir and step % FLAGS.checkpoint_interval == 0:
+            save_preemption_checkpoint(
+                FLAGS.checkpoint_dir,
+                agent,
+                step,
+                current_wandb_run_id,
+                replay_buffer=None  # Set to replay_buffer to save buffer state (increases checkpoint size)
+            )
 
         timer.tock("total")
 
@@ -806,6 +1036,18 @@ def main(_):
     ckpt_manager.save(step, args=ocp.args.StandardSave(agent))
     ckpt_manager.wait_until_finished()
     logging.info(f"Final checkpoint saved to {save_dir}")
+    
+    # Save final preemption checkpoint
+    if FLAGS.checkpoint_dir:
+        logging.info("Saving final preemption checkpoint...")
+        save_preemption_checkpoint(
+            FLAGS.checkpoint_dir,
+            agent,
+            step,
+            current_wandb_run_id,
+            replay_buffer=None
+        )
+        logging.info(f"✓ Final preemption checkpoint saved to {FLAGS.checkpoint_dir}")
 
 
 if __name__ == "__main__":
