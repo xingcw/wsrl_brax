@@ -95,6 +95,11 @@ flags.DEFINE_string("hypernet_ckpt_path", "", "Path to hypernet checkpoint direc
 flags.DEFINE_string("hypernet_ckpt_step", "best", "Hypernet checkpoint step (best/number)")
 flags.DEFINE_bool("hypernet_improve_init", False, "Use hypernet to improve initial policy before finetuning")
 flags.DEFINE_float("hypernet_target_reward", None, "Target reward for hypernet (default: 1.5x current)")
+flags.DEFINE_integer(
+    "resume_ckpt_axis_size",
+    16,
+    "Resume checkpoint sharding axis divisibility constraint (forwarded to utils.fsdp_utils.shard_module_params).",
+)
 
 # Reward settings
 flags.DEFINE_float("reward_scale", 1.0, "Reward scale.")
@@ -683,6 +688,7 @@ def main(_):
             checkpoint_path=FLAGS.hypernet_ckpt_path,
             checkpoint_step=FLAGS.hypernet_ckpt_step,
             seed=FLAGS.seed,
+            ckpt_axis_size=FLAGS.resume_ckpt_axis_size,
         )
         
         logging.info("=" * 80)
