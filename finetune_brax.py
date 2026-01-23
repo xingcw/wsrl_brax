@@ -18,8 +18,6 @@ os.environ["GRPC_VERBOSITY"] = "ERROR"  # Suppress gRPC warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-from typing import Optional
-from etils import epath
 import logging as python_logging
 # Reduce logging verbosity BEFORE importing JAX
 python_logging.getLogger("jax").setLevel(python_logging.ERROR)
@@ -48,7 +46,14 @@ from brax import envs as brax_envs
 from wsrl.agents import agents
 from wsrl.common.wandb import WandBLogger
 from wsrl.utils.timer_utils import Timer
-from wsrl.utils.train_utils import subsample_batch
+from wsrl.utils.train_utils import (
+    subsample_batch,
+    SimpleReplayBuffer,
+    make_brax_training_env,
+    improve_policy_with_hypernet,
+    evaluate_and_log_brax,
+)
+from wsrl.utils.ckpt_utils import load_preemption_checkpoint, save_preemption_checkpoint
 
 # Brax-specific imports
 from wsrl.envs.brax_dataset import (
@@ -59,10 +64,8 @@ from wsrl.utils.brax_utils import (
     BraxNormalizer,
     load_brax_q_network_to_wsrl_agent,
     load_brax_policy_to_wsrl_agent,
-    convert_wsrl_actor_to_brax_policy,
     verify_brax_wsrl_equivalence,
 )
-from wsrl.common.brax_evaluation import evaluate_brax_native
 
 from data_gen.mujoco.cartpole_brax import InvertedPendulum
 from data_gen.mujoco.ant_brax import Ant
@@ -151,212 +154,6 @@ config_flags.DEFINE_config_file(
 )
 
 
-# ============================================================================
-# Simple Replay Buffer (no Gym dependency)
-# ============================================================================
-
-class SimpleReplayBuffer:
-    """Simple replay buffer that doesn't depend on Gym spaces."""
-    
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        capacity: int,
-        seed: int = 0,
-    ):
-        self._capacity = capacity
-        self._size = 0
-        self._insert_index = 0
-        self._rng = np.random.default_rng(seed)
-        
-        # Pre-allocate arrays
-        self._observations = np.zeros((capacity, obs_dim), dtype=np.float32)
-        self._next_observations = np.zeros((capacity, obs_dim), dtype=np.float32)
-        self._actions = np.zeros((capacity, action_dim), dtype=np.float32)
-        self._rewards = np.zeros((capacity,), dtype=np.float32)
-        self._masks = np.zeros((capacity,), dtype=np.float32)
-        self._dones = np.zeros((capacity,), dtype=np.float32)
-    
-    def __len__(self):
-        return self._size
-    
-    def insert(self, transition: dict):
-        """Insert a single transition."""
-        idx = self._insert_index
-        self._observations[idx] = transition["observations"]
-        self._next_observations[idx] = transition["next_observations"]
-        self._actions[idx] = transition["actions"]
-        self._rewards[idx] = transition["rewards"]
-        self._masks[idx] = transition["masks"]
-        self._dones[idx] = transition["dones"]
-        
-        self._insert_index = (self._insert_index + 1) % self._capacity
-        self._size = min(self._size + 1, self._capacity)
-    
-    def insert_batch(self, transitions: dict):
-        """Insert a batch of transitions."""
-        batch_size = len(transitions["observations"])
-        for i in range(batch_size):
-            self.insert({
-                "observations": transitions["observations"][i],
-                "next_observations": transitions["next_observations"][i],
-                "actions": transitions["actions"][i],
-                "rewards": transitions["rewards"][i],
-                "masks": transitions["masks"][i],
-                "dones": transitions["dones"][i],
-            })
-    
-    def sample(self, batch_size: int) -> dict:
-        """Sample a random batch."""
-        indices = self._rng.integers(0, self._size, size=batch_size)
-        return {
-            "observations": self._observations[indices],
-            "next_observations": self._next_observations[indices],
-            "actions": self._actions[indices],
-            "rewards": self._rewards[indices],
-            "masks": self._masks[indices],
-            "dones": self._dones[indices],
-        }
-
-
-# ============================================================================
-# Brax Environment Helper
-# ============================================================================
-
-def make_brax_training_env(
-    env_name: str,
-    backend: str = "generalized",
-    episode_length: int = 1000,
-    mjcf_path: Optional[str] = None,
-    wandb_logger: Optional[WandBLogger] = None,
-):
-    """Create a Brax environment wrapped for training."""
-    if "s2r" in env_name:
-        if mjcf_path is None:
-            mjcf_path = os.path.join(epath.resource_path('data_gen'), f"assets/mjcf/{env_name}.xml")
-        else:
-            mjcf_path = mjcf_path
-        if wandb_logger is not None:
-            wandb_logger.save_file(mjcf_path, f"mjcf/{env_name}.xml")
-        base_env = brax_envs.get_environment(
-            env_name=env_name,
-            backend="generalized",
-            mjcf_path=mjcf_path
-        )
-    else:
-        base_env = brax_envs.get_environment(env_name=env_name, backend=backend)
-    wrapped_env = brax_envs.training.wrap(
-        base_env,
-        episode_length=episode_length,
-        action_repeat=1,
-    )
-    return base_env, wrapped_env
-
-
-# ============================================================================
-# Checkpoint Management (GCS-compatible)
-# ============================================================================
-
-def load_preemption_checkpoint(checkpoint_dir: str):
-    """Load checkpoint from GCS or local path if it exists.
-    
-    Returns:
-        tuple: (agent_state, step, wandb_run_id) or (None, 0, None) if no checkpoint
-    """
-    if not checkpoint_dir:
-        return None, 0, None
-    
-    ckpt_path = epath.Path(checkpoint_dir)
-    
-    try:
-        checkpointer = ocp.PyTreeCheckpointer()
-        latest_step = checkpointer.latest_step(ckpt_path)
-        
-        if latest_step is not None:
-            logging.info(f"🔄 Found checkpoint at step {latest_step}")
-            restored = checkpointer.restore(ckpt_path / str(latest_step))
-            
-            agent_state = restored.get('agent', None)
-            step = restored.get('step', latest_step)
-            wandb_run_id = restored.get('wandb_run_id', None)
-            replay_buffer_state = restored.get('replay_buffer', None)
-            
-            logging.info(f"✓ Successfully restored checkpoint from step {step}")
-            if wandb_run_id:
-                logging.info(f"✓ Found wandb run ID: {wandb_run_id}")
-            
-            return agent_state, int(step), wandb_run_id, replay_buffer_state
-        else:
-            logging.info(f"🆕 No checkpoint found in {checkpoint_dir}")
-            return None, 0, None, None
-    except Exception as e:
-        logging.warning(f"⚠️  Failed to load checkpoint: {e}")
-        return None, 0, None, None
-
-
-def save_preemption_checkpoint(checkpoint_dir: str, agent, step: int, wandb_run_id: str, replay_buffer=None):
-    """Save checkpoint to GCS or local path for preemption recovery.
-    
-    Args:
-        checkpoint_dir: Path to save checkpoint (supports GCS)
-        agent: The agent to save
-        step: Current training step
-        wandb_run_id: Wandb run ID for resume
-        replay_buffer: Optional replay buffer to save
-    """
-    if not checkpoint_dir:
-        return
-    
-    ckpt_path = epath.Path(checkpoint_dir)
-    
-    try:
-        # Prepare checkpoint data
-        ckpt_data = {
-            'agent': agent,
-            'step': step,
-            'wandb_run_id': wandb_run_id,
-        }
-        
-        # Optionally include replay buffer (can be large)
-        if replay_buffer is not None:
-            try:
-                ckpt_data['replay_buffer'] = {
-                    'observations': replay_buffer._observations[:replay_buffer._size],
-                    'next_observations': replay_buffer._next_observations[:replay_buffer._size],
-                    'actions': replay_buffer._actions[:replay_buffer._size],
-                    'rewards': replay_buffer._rewards[:replay_buffer._size],
-                    'masks': replay_buffer._masks[:replay_buffer._size],
-                    'dones': replay_buffer._dones[:replay_buffer._size],
-                    'size': replay_buffer._size,
-                    'insert_index': replay_buffer._insert_index,
-                }
-            except Exception as e:
-                logging.warning(f"⚠️  Failed to save replay buffer: {e}")
-        
-        checkpointer = ocp.PyTreeCheckpointer()
-        checkpointer.save(
-            ckpt_path / str(step),
-            ckpt_data,
-            force=True
-        )
-        
-        # Clean up old checkpoints (keep only latest 3)
-        try:
-            all_steps = [int(p.name) for p in ckpt_path.iterdir() if p.name.isdigit()]
-            if len(all_steps) > 3:
-                all_steps.sort()
-                for old_step in all_steps[:-3]:  # Keep only last 3
-                    old_path = ckpt_path / str(old_step)
-                    if old_path.exists():
-                        ocp.utils.rmtree(old_path)
-        except Exception as e:
-            logging.warning(f"⚠️  Failed to clean up old checkpoints: {e}")
-        
-    except Exception as e:
-        logging.error(f"❌ Failed to save checkpoint: {e}")
-
-
 def main(_):
     """
     House keeping
@@ -397,16 +194,17 @@ def main(_):
     resumed_step = 0
     resumed_wandb_run_id = None
     resumed_replay_buffer_state = None
+    preemption_ckpt_manager = None
     
     if FLAGS.checkpoint_dir:
         logging.info("=" * 80)
         logging.info("CHECKING FOR EXISTING CHECKPOINT")
         logging.info("=" * 80)
-        resumed_agent_state, resumed_step, resumed_wandb_run_id, resumed_replay_buffer_state = load_preemption_checkpoint(
-            FLAGS.checkpoint_dir
-        )
+        resumed_agent_state, resumed_step, resumed_wandb_run_id, \
+            resumed_replay_buffer_state, preemption_ckpt_manager = \
+                load_preemption_checkpoint(FLAGS.checkpoint_dir)
         if resumed_agent_state is not None:
-            logging.info(f"✓ Will resume from step {resumed_step}")
+            logging.info(f"Will resume from step {resumed_step}")
         logging.info("=" * 80)
     
     """
@@ -435,12 +233,9 @@ def main(_):
         ckpt_id = FLAGS.brax_ckpt_idx if FLAGS.brax_ckpt_idx >= 0 else "latest"
         group_parts.append(f"ckpt{ckpt_id}")
     
-    # Add hypernet indicator if using hypernet
-    if FLAGS.hypernet_config_path and FLAGS.hypernet_ckpt_path:
-        hypernet_tag = "hypernet"
-        if FLAGS.hypernet_improve_init:
-            hypernet_tag += "_init"
-        group_parts.append(hypernet_tag)
+    # Add hypernet indicator if using hypernet for init improvement
+    if FLAGS.hypernet_improve_init and FLAGS.hypernet_config_path and FLAGS.hypernet_ckpt_path:
+        group_parts.append("hypernet_init")
     
     # Group name: everything EXCEPT seed (for aggregating across seeds)
     group_name = "_".join(group_parts) if group_parts else "default_group"
@@ -475,7 +270,7 @@ def main(_):
     
     # If resuming, use the saved run ID to continue the same wandb run
     if resumed_wandb_run_id:
-        logging.info(f"🔄 Resuming wandb run: {resumed_wandb_run_id}")
+        logging.info(f"Resuming wandb run: {resumed_wandb_run_id}")
         # Override the experiment_id to use the resumed ID
         wandb_config.update({
             "unique_identifier": "",  # Will be set to resumed ID
@@ -502,8 +297,9 @@ def main(_):
         # Create a simple wrapper to match WandBLogger interface
         class ResumedWandBLogger:
             def __init__(self, run, config):
+                from omegaconf import DictConfig
                 self.run = run
-                self.config = ml_collections.ConfigDict(config)
+                self.config = DictConfig(config)
                 
             def log(self, data: dict, step: int = None):
                 from wsrl.common.wandb import _recursive_flatten_dict
@@ -559,7 +355,7 @@ def main(_):
     )
     
     # Initialize Orbax checkpoint manager for saving
-    checkpoint_options = ocp.CheckpointManagerOptions(max_to_keep=30)
+    checkpoint_options = ocp.CheckpointManagerOptions(max_to_keep=3)
     ckpt_manager = ocp.CheckpointManager(save_dir, options=checkpoint_options)
 
     """
@@ -603,7 +399,7 @@ def main(_):
     
     # Restore replay buffer from checkpoint if available
     if resumed_replay_buffer_state is not None:
-        logging.info("🔄 Restoring replay buffer from checkpoint...")
+        logging.info("Restoring replay buffer from checkpoint...")
         try:
             buffer_size = resumed_replay_buffer_state['size']
             replay_buffer._observations[:buffer_size] = resumed_replay_buffer_state['observations']
@@ -614,9 +410,9 @@ def main(_):
             replay_buffer._dones[:buffer_size] = resumed_replay_buffer_state['dones']
             replay_buffer._size = buffer_size
             replay_buffer._insert_index = resumed_replay_buffer_state['insert_index']
-            logging.info(f"✓ Replay buffer restored with {buffer_size} transitions")
+            logging.info(f"Replay buffer restored with {buffer_size} transitions")
         except Exception as e:
-            logging.warning(f"⚠️  Failed to restore replay buffer: {e}. Starting with empty buffer.")
+            logging.warning(f"Failed to restore replay buffer: {e}. Starting with empty buffer.")
 
     """
     Initialize agent
@@ -661,16 +457,16 @@ def main(_):
     
     # Restore from preemption checkpoint if it exists (overrides resume_path)
     if resumed_agent_state is not None:
-        logging.info("🔄 Restoring agent state from preemption checkpoint...")
+        logging.info("Restoring agent state from preemption checkpoint...")
         agent = resumed_agent_state
-        logging.info(f"✓ Agent restored from step {resumed_step}")
+        logging.info(f"Agent restored from step {resumed_step}")
 
     """
-    Load Hypernet and generate parameters (if specified)
+    Load Hypernet and generate parameters (if specified and used for init improvement)
     """
     hypernet_loader = None
     
-    if FLAGS.hypernet_config_path != "" and FLAGS.hypernet_ckpt_path != "":
+    if FLAGS.hypernet_improve_init and FLAGS.hypernet_config_path != "" and FLAGS.hypernet_ckpt_path != "":
         # Warn if both hypernet and Brax checkpoint are specified
         if FLAGS.brax_ckpt_path != "":
             logging.warning(
@@ -754,86 +550,6 @@ def main(_):
         )
         jax.config.update("jax_default_matmul_precision", prev_matmul_precision)
         logging.info("Verification passed!")
-    """
-    Helper function to use hypernet for parameter improvement
-    """
-    def improve_policy_with_hypernet(
-        current_agent,
-        hypernet_loader,
-        brax_normalizer_params,
-        current_rewards,
-        target_rewards,
-        loss_cond=None
-    ):
-        """Use hypernet to generate improved policy parameters."""
-        if hypernet_loader is None:
-            return current_agent
-        
-        logging.info("=" * 80)
-        logging.info("IMPROVING POLICY WITH HYPERNET")
-        logging.info("=" * 80)
-        logging.info(f"Current rewards: {current_rewards:.2f}")
-        logging.info(f"Target rewards: {target_rewards:.2f}")
-        
-        # Extract current policy parameters from agent
-        wsrl_actor_params = current_agent.state.params['modules_actor']
-        current_brax_policy_params = convert_wsrl_actor_to_brax_policy(wsrl_actor_params)
-        
-        # Generate improved parameters with hypernet
-        improved_brax_policy_params = hypernet_loader.generate_parameters(
-            policy_normalizer=brax_normalizer_params,
-            policy_params=current_brax_policy_params,
-            current_rewards=current_rewards,
-            target_rewards=target_rewards,
-            loss_cond=loss_cond,
-            seed=FLAGS.seed,
-        )
-        
-        # Load improved parameters into agent
-        improved_agent = load_brax_policy_to_wsrl_agent(
-            current_agent,
-            improved_brax_policy_params,
-            brax_normalizer_params=brax_normalizer_params,
-            absorb_normalizer=False,
-        )
-        
-        logging.info("✓ Successfully generated and loaded improved parameters!")
-        logging.info("=" * 80)
-        
-        return improved_agent
-    
-    """
-    Evaluation function using native Brax
-    """
-    def evaluate_and_log(
-        wsrl_agent, 
-        normalizer_params, 
-        env, 
-        step_number, 
-        wandb_logger=None, 
-        episode_length=1000
-    ):
-        # Extract policy params from agent and convert to Brax format
-        wsrl_actor_params = wsrl_agent.state.params['modules_actor']
-        current_brax_policy_params = convert_wsrl_actor_to_brax_policy(wsrl_actor_params)
-        
-        brax_metrics = evaluate_brax_native(
-            env,
-            current_brax_policy_params,
-            normalizer_params,
-            hidden_layer_sizes=tuple(brax_hidden_dims),
-            seed=FLAGS.seed,
-            episode_length=episode_length,
-            num_eval_envs=FLAGS.brax_num_eval_envs,
-        )
-        
-        eval_info = {
-            "brax_native_return": brax_metrics["episode_reward"],
-            "brax_native_length": brax_metrics["episode_length"],
-        }
-        if wandb_logger is not None:
-            wandb_logger.log({"evaluation": eval_info}, step=step_number)
-        return eval_info
 
     """
     Training loop
@@ -843,7 +559,7 @@ def main(_):
     # Start from resumed step if available, otherwise from agent's step
     if resumed_step > 0:
         step = resumed_step
-        logging.info(f"🔄 Resuming training from step {step}")
+        logging.info(f"Resuming training from step {step}")
     else:
         step = int(agent.state.step)  # 0 for new agents, or load from pre-trained
     
@@ -859,24 +575,30 @@ def main(_):
     if FLAGS.hypernet_improve_init:
         # Evaluate current policy first
         logging.info("Evaluating initial policy before hypernet improvement...")
-        initial_eval = evaluate_and_log(
+        initial_eval = evaluate_and_log_brax(
             agent, 
             brax_normalizer_params, 
             brax_base_env, 
-            step, 
-            wandb_logger=None, 
-            episode_length=200
+            step,
+            brax_hidden_dims,
+            FLAGS.seed,
+            num_eval_envs=FLAGS.brax_num_eval_envs,
+            episode_length=200,
+            wandb_logger=None,
         )
         current_reward = initial_eval['brax_native_return']
         target_reward = FLAGS.hypernet_target_reward
 
-        full_eval_res = evaluate_and_log(
+        full_eval_res = evaluate_and_log_brax(
             agent, 
             brax_normalizer_params, 
             brax_base_env, 
-            step, 
-            wandb_logger=wandb_logger, 
-            episode_length=1000
+            step,
+            brax_hidden_dims,
+            FLAGS.seed,
+            num_eval_envs=FLAGS.brax_num_eval_envs,
+            episode_length=1000,
+            wandb_logger=wandb_logger,
         )
         logging.info(f"Full evaluation result: {full_eval_res}")
         
@@ -887,18 +609,22 @@ def main(_):
             brax_normalizer_params=brax_normalizer_params,
             current_rewards=current_reward,
             target_rewards=target_reward,
+            seed=FLAGS.seed,
             loss_cond=None
         )
         
         # Evaluate improved policy
         logging.info("Evaluating improved policy after hypernet...")
-        improved_eval = evaluate_and_log(
+        improved_eval = evaluate_and_log_brax(
             agent, 
             brax_normalizer_params, 
             brax_base_env, 
-            step, 
-            wandb_logger=None, 
-            episode_length=200
+            step,
+            brax_hidden_dims,
+            FLAGS.seed,
+            num_eval_envs=FLAGS.brax_num_eval_envs,
+            episode_length=200,
+            wandb_logger=None,
         )
         improved_reward = improved_eval['brax_native_return']
         logging.info(f"Reward improvement: {current_reward:.2f} → "
@@ -1001,7 +727,17 @@ def main(_):
         if step % FLAGS.eval_interval == 0 or step in eval_steps:
             logging.info("Evaluating...")
             with timer.context("evaluation"):
-                eval_info = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger)
+                eval_info = evaluate_and_log_brax(
+                    agent,
+                    brax_normalizer_params,
+                    brax_base_env,
+                    step,
+                    brax_hidden_dims,
+                    FLAGS.seed,
+                    num_eval_envs=FLAGS.brax_num_eval_envs,
+                    episode_length=FLAGS.brax_episode_length,
+                    wandb_logger=wandb_logger
+                )
                 if eval_info:
                     logging.info(f"Step {step}: brax_return={eval_info['brax_native_return']:.2f}, brax_length={eval_info['brax_native_length']:.2f}")
 
@@ -1022,7 +758,8 @@ def main(_):
                 agent,
                 step,
                 current_wandb_run_id,
-                replay_buffer=None  # Set to replay_buffer to save buffer state (increases checkpoint size)
+                replay_buffer=None,  # Set to replay_buffer to save buffer state (increases checkpoint size)
+                ckpt_manager=preemption_ckpt_manager
             )
 
         timer.tock("total")
@@ -1051,9 +788,10 @@ def main(_):
             agent,
             step,
             current_wandb_run_id,
-            replay_buffer=None
+            replay_buffer=None,
+            ckpt_manager=preemption_ckpt_manager
         )
-        logging.info(f"✓ Final preemption checkpoint saved to {FLAGS.checkpoint_dir}")
+        logging.info(f"Final preemption checkpoint saved to {FLAGS.checkpoint_dir}")
 
 
 if __name__ == "__main__":
