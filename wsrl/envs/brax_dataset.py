@@ -39,17 +39,41 @@ def load_brax_sac_checkpoint(
         eval_metrics: Optional evaluation metrics if available
         q_network_params: Optional Q-network parameters if load_q_network=True
     """
+    # Check if path is GCS
+    is_gcs = ckpt_path.startswith("gs://")
+    
     # Handle both directory and file paths
-    if os.path.isdir(ckpt_path):
-        ckpt_file = os.path.join(ckpt_path, "sac_params.pkl")
+    if is_gcs:
+        # Import tensorflow for GCS support
+        import tensorflow as tf
+        
+        # For GCS paths, check if it's a directory by checking if sac_params.pkl exists
+        if ckpt_path.endswith(".pkl"):
+            ckpt_file = ckpt_path
+        else:
+            # Remove trailing slash if present
+            ckpt_path = ckpt_path.rstrip("/")
+            ckpt_file = f"{ckpt_path}/sac_params.pkl"
+        
+        # Check if file exists
+        if not tf.io.gfile.exists(ckpt_file):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_file}")
+        
+        # Load from GCS
+        with tf.io.gfile.GFile(ckpt_file, "rb") as f:
+            sac_params = pickle.load(f)
     else:
-        ckpt_file = ckpt_path
-    
-    if not os.path.exists(ckpt_file):
-        raise FileNotFoundError(f"Checkpoint file not found: {ckpt_file}")
-    
-    with open(ckpt_file, "rb") as f:
-        sac_params = pickle.load(f)
+        # Local path handling
+        if os.path.isdir(ckpt_path):
+            ckpt_file = os.path.join(ckpt_path, "sac_params.pkl")
+        else:
+            ckpt_file = ckpt_path
+        
+        if not os.path.exists(ckpt_file):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_file}")
+        
+        with open(ckpt_file, "rb") as f:
+            sac_params = pickle.load(f)
     
     # Unpack the checkpoint
     normalizer_params_all, policy_params_all = sac_params
@@ -74,10 +98,18 @@ def load_brax_sac_checkpoint(
     
     # Try to load eval metrics if available
     eval_metrics = None
-    eval_metrics_file = os.path.join(os.path.dirname(ckpt_file), "sac_metrics.pkl")
-    if os.path.exists(eval_metrics_file):
-        with open(eval_metrics_file, "rb") as f:
-            eval_metrics = pickle.load(f)
+    if is_gcs:
+        import tensorflow as tf
+        # For GCS, construct path by replacing filename
+        eval_metrics_file = ckpt_file.replace("sac_params.pkl", "sac_metrics.pkl")
+        if tf.io.gfile.exists(eval_metrics_file):
+            with tf.io.gfile.GFile(eval_metrics_file, "rb") as f:
+                eval_metrics = pickle.load(f)
+    else:
+        eval_metrics_file = os.path.join(os.path.dirname(ckpt_file), "sac_metrics.pkl")
+        if os.path.exists(eval_metrics_file):
+            with open(eval_metrics_file, "rb") as f:
+                eval_metrics = pickle.load(f)
     
     logging.info(f"Loaded checkpoint from {ckpt_file} with checkpoint index {checkpoint_idx}")
     logging.info(f"Eval metrics: {eval_metrics}")
@@ -85,9 +117,20 @@ def load_brax_sac_checkpoint(
     # Try to load Q-network params if requested
     q_network_params = None
     if load_q_network:
-        q_params_file = os.path.join(os.path.dirname(ckpt_file), "sac_q_params.pkl")
-        with open(q_params_file, "rb") as f:
-            q_network_data = pickle.load(f)
+        if is_gcs:
+            import tensorflow as tf
+            # For GCS, construct path by replacing filename
+            q_params_file = ckpt_file.replace("sac_params.pkl", "sac_q_params.pkl")
+            if not tf.io.gfile.exists(q_params_file):
+                raise FileNotFoundError(f"Q-network checkpoint file not found: {q_params_file}")
+            with tf.io.gfile.GFile(q_params_file, "rb") as f:
+                q_network_data = pickle.load(f)
+        else:
+            q_params_file = os.path.join(os.path.dirname(ckpt_file), "sac_q_params.pkl")
+            if not os.path.exists(q_params_file):
+                raise FileNotFoundError(f"Q-network checkpoint file not found: {q_params_file}")
+            with open(q_params_file, "rb") as f:
+                q_network_data = pickle.load(f)
         
         # Extract q_params at the specified checkpoint index
         q_params_all = q_network_data['q_params']
