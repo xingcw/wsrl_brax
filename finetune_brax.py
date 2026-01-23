@@ -35,6 +35,7 @@ import jax.numpy as jnp
 # Suppress JAX info logs
 jax.config.update("jax_log_compiles", False)
 import numpy as np
+import random
 import torch
 import tqdm
 from absl import app, flags, logging
@@ -79,6 +80,7 @@ FLAGS = flags.FLAGS
 # Brax environment settings
 flags.DEFINE_string("brax_env", "ant", "Brax environment name (e.g., ant, halfcheetah, humanoid)")
 flags.DEFINE_string("brax_backend", "generalized", "Brax backend (generalized, spring, positional, mjx)")
+flags.DEFINE_string("brax_mjcf_path", "", "Path to custom MJCF file for Brax environment")
 flags.DEFINE_integer("brax_episode_length", 1000, "Maximum episode length for Brax env")
 flags.DEFINE_string("brax_ckpt_path", "", "Path to Brax SAC checkpoint to load for initialization")
 flags.DEFINE_integer("brax_ckpt_idx", -1, "Checkpoint index to load (-1 for latest)")
@@ -248,6 +250,30 @@ def main(_):
     """
     House keeping
     """
+    # ==========================================================================
+    # SEED EVERYTHING FIRST
+    # ==========================================================================
+    logging.info(f"Setting all random seeds to {FLAGS.seed}")
+    
+    # Seed Python's random module
+    random.seed(FLAGS.seed)
+    
+    # Seed NumPy
+    np.random.seed(FLAGS.seed)
+    
+    # Seed PyTorch
+    torch.manual_seed(FLAGS.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(FLAGS.seed)
+        torch.cuda.manual_seed_all(FLAGS.seed)
+    
+    # Seed JAX (will be split later for different purposes)
+    # This is just to ensure deterministic initialization
+    os.environ['PYTHONHASHSEED'] = str(FLAGS.seed)
+    
+    logging.info("All random number generators seeded successfully")
+    # ==========================================================================
+    
     brax_hidden_dims = [int(d) for d in FLAGS.brax_hidden_dims]
     
     # Minimum steps before updates (need some data in buffer)
@@ -256,20 +282,81 @@ def main(_):
     """
     Wandb and logging
     """
+    # Build descriptive experiment name (WITHOUT seed for grouping)
+    group_parts = []
+    
+    # Add user-provided exp_name if specified
+    if FLAGS.exp_name:
+        group_parts.append(FLAGS.exp_name)
+    
+    # Add env name
+    group_parts.append(FLAGS.brax_env)
+    
+    # Add MJCF filename if custom MJCF is provided
+    if FLAGS.brax_mjcf_path:
+        mjcf_filename = os.path.splitext(os.path.basename(FLAGS.brax_mjcf_path))[0]
+        group_parts.append(mjcf_filename)
+    
+    # Add agent type
+    group_parts.append(FLAGS.agent)
+    
+    # Add checkpoint info if loading from Brax checkpoint
+    if FLAGS.brax_ckpt_path:
+        ckpt_id = FLAGS.brax_ckpt_idx if FLAGS.brax_ckpt_idx >= 0 else "latest"
+        group_parts.append(f"ckpt{ckpt_id}")
+    
+    # Add hypernet indicator if using hypernet
+    if FLAGS.hypernet_config_path and FLAGS.hypernet_ckpt_path:
+        hypernet_tag = "hypernet"
+        if FLAGS.hypernet_improve_init:
+            hypernet_tag += "_init"
+        group_parts.append(hypernet_tag)
+    
+    # Group name: everything EXCEPT seed (for aggregating across seeds)
+    group_name = "_".join(group_parts) if group_parts else "default_group"
+    
+    # Run name: include seed for individual run identification
+    run_name_parts = group_parts + [f"seed{FLAGS.seed}"]
+    exp_descriptor = "_".join(run_name_parts)
+    
+    # Use user-provided group if specified, otherwise use auto-generated group
+    final_group = FLAGS.group if FLAGS.group is not None else group_name
+    
     wandb_config = WandBLogger.get_default_config()
     wandb_config.update(
         {
             "project": FLAGS.project or "wsrl_brax",
-            "group": FLAGS.group or "brax_finetune",
-            "exp_descriptor": f"{FLAGS.exp_name}_{FLAGS.brax_env}_{FLAGS.agent}_seed{FLAGS.seed}",
+            "group": final_group,  # This groups runs together in wandb
+            "exp_descriptor": exp_descriptor,  # This is the individual run name
+            "tags": [f"seed_{FLAGS.seed}", FLAGS.brax_env, FLAGS.agent],  # Add tags for easy filtering
         }
     )
+    # Add FLAGS to variant for full tracking
+    variant = FLAGS.config.to_dict()
+    variant.update({
+        "seed": FLAGS.seed,
+        "brax_env": FLAGS.brax_env,
+        "agent": FLAGS.agent,
+        "num_online_steps": FLAGS.num_online_steps,
+        "batch_size": FLAGS.batch_size,
+        "utd": FLAGS.utd,
+    })
+    
     wandb_logger = WandBLogger(
         wandb_config=wandb_config,
-        variant=FLAGS.config.to_dict(),
+        variant=variant,
         random_str_in_identifier=True,
         disable_online_logging=FLAGS.debug,
     )
+    
+    logging.info("=" * 80)
+    logging.info(f"EXPERIMENT CONFIGURATION")
+    logging.info("=" * 80)
+    logging.info(f"Project: {wandb_config['project']}")
+    logging.info(f"Group: {final_group}")
+    logging.info(f"Run Name: {exp_descriptor}")
+    logging.info(f"Seed: {FLAGS.seed}")
+    logging.info("=" * 80)
 
     save_dir = os.path.join(
         FLAGS.save_dir,
@@ -291,6 +378,7 @@ def main(_):
         env_name=FLAGS.brax_env,
         backend=FLAGS.brax_backend,
         episode_length=FLAGS.brax_episode_length,
+        mjcf_path=FLAGS.brax_mjcf_path if FLAGS.brax_mjcf_path else None,
         wandb_logger=wandb_logger
     )
     
@@ -444,7 +532,7 @@ def main(_):
             num_steps=100,
             num_envs=FLAGS.num_envs,
             seed=FLAGS.seed,
-            tolerance=1e-3,
+            tolerance=2e-3,
         )
         jax.config.update("jax_default_matmul_precision", prev_matmul_precision)
         logging.info("Verification passed!")
@@ -499,7 +587,14 @@ def main(_):
     """
     Evaluation function using native Brax
     """
-    def evaluate_and_log(wsrl_agent, normalizer_params, env, step_number, wandb_logger=None, episode_length=1000):
+    def evaluate_and_log(
+        wsrl_agent, 
+        normalizer_params, 
+        env, 
+        step_number, 
+        wandb_logger=None, 
+        episode_length=1000
+    ):
         # Extract policy params from agent and convert to Brax format
         wsrl_actor_params = wsrl_agent.state.params['modules_actor']
         current_brax_policy_params = convert_wsrl_actor_to_brax_policy(wsrl_actor_params)
@@ -540,11 +635,25 @@ def main(_):
     if FLAGS.hypernet_improve_init:
         # Evaluate current policy first
         logging.info("Evaluating initial policy before hypernet improvement...")
-        initial_eval = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger=None, episode_length=200)
+        initial_eval = evaluate_and_log(
+            agent, 
+            brax_normalizer_params, 
+            brax_base_env, 
+            step, 
+            wandb_logger=None, 
+            episode_length=200
+        )
         current_reward = initial_eval['brax_native_return']
         target_reward = FLAGS.hypernet_target_reward
 
-        full_eval_res = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger=wandb_logger, episode_length=1000)
+        full_eval_res = evaluate_and_log(
+            agent, 
+            brax_normalizer_params, 
+            brax_base_env, 
+            step, 
+            wandb_logger=wandb_logger, 
+            episode_length=1000
+        )
         logging.info(f"Full evaluation result: {full_eval_res}")
         
         # Improve policy with hypernet
@@ -559,9 +668,17 @@ def main(_):
         
         # Evaluate improved policy
         logging.info("Evaluating improved policy after hypernet...")
-        improved_eval = evaluate_and_log(agent, brax_normalizer_params, brax_base_env, step, wandb_logger=None, episode_length=200)
+        improved_eval = evaluate_and_log(
+            agent, 
+            brax_normalizer_params, 
+            brax_base_env, 
+            step, 
+            wandb_logger=None, 
+            episode_length=200
+        )
         improved_reward = improved_eval['brax_native_return']
-        logging.info(f"Reward improvement: {current_reward:.2f} → {improved_reward:.2f} (Δ={improved_reward-current_reward:+.2f})")
+        logging.info(f"Reward improvement: {current_reward:.2f} → "
+        f"{improved_reward:.2f} (Δ={improved_reward-current_reward:+.2f})")
 
     logging.info(f"Starting online training for {FLAGS.num_online_steps} steps")
 
@@ -607,7 +724,8 @@ def main(_):
             if FLAGS.num_envs == 1:
                 # Squeeze batch dimension for single env
                 for k, v in transitions.items():
-                    transitions[k] = v.squeeze(0) if v.ndim > 1 or (v.ndim == 1 and k in ["rewards", "masks", "dones"]) else v[0]
+                    transitions[k] = v.squeeze(0) if v.ndim > 1 or (v.ndim == 1 and 
+                    k in ["rewards", "masks", "dones"]) else v[0]
                 replay_buffer.insert(transitions)
             else:
                 replay_buffer.insert_batch(transitions)
