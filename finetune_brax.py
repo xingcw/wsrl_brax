@@ -230,6 +230,8 @@ def main(_):
     
     # Add checkpoint info if loading from Brax checkpoint
     if FLAGS.brax_ckpt_path:
+        brax_ckpt_basename = os.path.basename(FLAGS.brax_ckpt_path.rstrip("/"))
+        group_parts.append(brax_ckpt_basename)
         ckpt_id = FLAGS.brax_ckpt_idx if FLAGS.brax_ckpt_idx >= 0 else "latest"
         group_parts.append(f"ckpt{ckpt_id}")
     

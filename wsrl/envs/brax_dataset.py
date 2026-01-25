@@ -5,7 +5,7 @@ Utilities for loading Brax SAC checkpoints and creating datasets for finetuning.
 import logging
 import os
 import pickle
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -146,6 +146,67 @@ def load_brax_sac_checkpoint(
         logging.info(f"Loaded Q-network params from {q_params_file} with checkpoint index {checkpoint_idx}")
     
     return normalizer_params, policy_params, eval_metrics, q_network_params
+
+
+def load_brax_sac_checkpoint_all(
+    ckpt_path: str,
+    num_checkpoints: int = -1,
+) -> List[Tuple[Any, Any]]:
+    """
+    Load all stacked checkpoints from a Brax sac_params.pkl.
+
+    When the pickle contains multiple training snapshots stacked along axis 0,
+    returns one (normalizer_params, policy_params) per snapshot. Otherwise
+    returns a single-element list.
+
+    Args:
+        ckpt_path: Path to the checkpoint directory or sac_params.pkl file.
+
+    Returns:
+        List of (normalizer_params, policy_params) in Brax format.
+    """
+    is_gcs = ckpt_path.startswith("gs://")
+
+    if is_gcs:
+        import tensorflow as tf
+
+        if ckpt_path.endswith(".pkl"):
+            ckpt_file = ckpt_path
+        else:
+            ckpt_path = ckpt_path.rstrip("/")
+            ckpt_file = f"{ckpt_path}/sac_params.pkl"
+
+        if not tf.io.gfile.exists(ckpt_file):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_file}")
+        with tf.io.gfile.GFile(ckpt_file, "rb") as f:
+            sac_params = pickle.load(f)
+    else:
+        if os.path.isdir(ckpt_path):
+            ckpt_file = os.path.join(ckpt_path, "sac_params.pkl")
+        else:
+            ckpt_file = ckpt_path
+        if not os.path.exists(ckpt_file):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_file}")
+        with open(ckpt_file, "rb") as f:
+            sac_params = pickle.load(f)
+
+    normalizer_params_all, policy_params_all = sac_params
+
+    def extract(params, idx: int):
+        return jax.tree_util.tree_map(
+            lambda x: x[idx] if isinstance(x, (np.ndarray, jnp.ndarray)) and x.ndim > 1 else x,
+            params,
+        )
+
+    mean = np.array(normalizer_params_all.mean)
+    if mean.ndim > 1:
+        n = int(mean.shape[0])
+        out = [(extract(normalizer_params_all, i), extract(policy_params_all, i)) for i in range(n)]
+    else:
+        out = [(normalizer_params_all, policy_params_all)]
+
+    logging.info("Loaded %d checkpoint(s) from %s", len(out), ckpt_file)
+    return out[:num_checkpoints]
 
 
 def convert_brax_normalizer_to_dict(normalizer_params) -> Dict[str, np.ndarray]:
