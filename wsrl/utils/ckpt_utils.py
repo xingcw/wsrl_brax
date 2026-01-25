@@ -5,6 +5,19 @@ from absl import logging
 import orbax.checkpoint as ocp
 
 
+def _extract_wandb_run_id(v):
+    """Extract a string wandb run ID from a possibly wrapped/array value (e.g. numpy scalar)."""
+    if v is None:
+        return None
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    try:
+        s = str(v).strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
 def load_preemption_checkpoint(checkpoint_dir: str):
     """Load checkpoint from GCS or local path if it exists.
     
@@ -28,16 +41,17 @@ def load_preemption_checkpoint(checkpoint_dir: str):
             logging.info(f"Found checkpoint at step {latest_step} (CheckpointManager format)")
             try:
                 restored = ckpt_manager.restore(latest_step)
-                # Handle StandardSave format - extract the actual data
-                if not isinstance(restored, dict):
-                    # StandardSave wraps the data, try to extract it
-                    ckpt_data = restored if hasattr(restored, 'get') else {'agent': restored}
-                else:
+                # Handle StandardSave format: dict, dict-like, or wrapped
+                if isinstance(restored, dict):
                     ckpt_data = restored
+                elif hasattr(restored, 'get') and callable(getattr(restored, 'get')):
+                    ckpt_data = restored
+                else:
+                    ckpt_data = {'agent': restored, 'step': latest_step, 'wandb_run_id': None, 'replay_buffer': None}
                 
                 agent_state = ckpt_data.get('agent', None) if isinstance(ckpt_data, dict) else None
                 step = ckpt_data.get('step', latest_step) if isinstance(ckpt_data, dict) else latest_step
-                wandb_run_id = ckpt_data.get('wandb_run_id', None) if isinstance(ckpt_data, dict) else None
+                wandb_run_id = _extract_wandb_run_id(ckpt_data.get('wandb_run_id', None) if isinstance(ckpt_data, dict) else None)
                 replay_buffer_state = ckpt_data.get('replay_buffer', None) if isinstance(ckpt_data, dict) else None
                 
                 logging.info(f"Successfully restored checkpoint from step {step}")
@@ -58,7 +72,7 @@ def load_preemption_checkpoint(checkpoint_dir: str):
             
             agent_state = restored.get('agent', None)
             step = restored.get('step', latest_step)
-            wandb_run_id = restored.get('wandb_run_id', None)
+            wandb_run_id = _extract_wandb_run_id(restored.get('wandb_run_id', None))
             replay_buffer_state = restored.get('replay_buffer', None)
             
             logging.info(f"Successfully restored checkpoint from step {step}")

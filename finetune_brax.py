@@ -273,9 +273,8 @@ def main(_):
     # If resuming, use the saved run ID to continue the same wandb run
     if resumed_wandb_run_id:
         logging.info(f"Resuming wandb run: {resumed_wandb_run_id}")
-        # Override the experiment_id to use the resumed ID
         wandb_config.update({
-            "unique_identifier": "",  # Will be set to resumed ID
+            "unique_identifier": resumed_wandb_run_id,
             "experiment_id": resumed_wandb_run_id,
         })
         
@@ -291,7 +290,7 @@ def main(_):
             group=wandb_config['group'],
             dir=wandb_output_dir,
             id=resumed_wandb_run_id,
-            resume="must",
+            resume="allow",  # "allow" creates new run if not synced yet (e.g. crash before first wandb sync)
             save_code=True,
             mode="disabled" if FLAGS.debug else "online",
         )
@@ -328,13 +327,17 @@ def main(_):
             disable_online_logging=FLAGS.debug,
         )
     
-    # Save wandb run ID for future resumption
+    # Save wandb run ID for future resumption (must be set for checkpoint to support wandb resume)
+    import wandb as _wandb
     current_wandb_run_id = None
     if hasattr(wandb_logger, 'run') and wandb_logger.run is not None:
-        current_wandb_run_id = wandb_logger.run.id
+        current_wandb_run_id = getattr(wandb_logger.run, 'id', None)
+    if current_wandb_run_id is None and _wandb.run is not None:
+        current_wandb_run_id = getattr(_wandb.run, 'id', None)
+    if current_wandb_run_id:
         logging.info(f"Wandb run ID: {current_wandb_run_id}")
     else:
-        logging.warning("Could not get wandb run ID")
+        logging.warning("Could not get wandb run ID; wandb will not resume after preemption")
     
     logging.info("=" * 80)
     logging.info(f"EXPERIMENT CONFIGURATION")
@@ -754,7 +757,8 @@ def main(_):
         """
         Save Preemption-Safe Checkpoint (for auto-resume after TPU preemption)
         """
-        if FLAGS.checkpoint_dir and step % FLAGS.checkpoint_interval == 0:
+        if FLAGS.checkpoint_dir and (step % FLAGS.checkpoint_interval == 0 or step == 1):
+            # step==1: persist wandb_run_id early in case of crash before first interval
             save_preemption_checkpoint(
                 FLAGS.checkpoint_dir,
                 agent,
