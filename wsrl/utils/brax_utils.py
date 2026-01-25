@@ -205,55 +205,43 @@ def _absorb_normalizer(
 class BraxNormalizer:
     """
     Wrapper class for applying Brax-style observation normalization.
-    
-    This can be used to normalize observations before passing to the policy
-    when the normalizer was not absorbed into the network weights.
-    
-    JAX-compatible: works with both numpy arrays and JAX arrays, and can be
-    used inside JIT-compiled functions.
     """
     
-    def __init__(self, mean: np.ndarray, std: np.ndarray, clip: float = 10.0):
+    def __init__(self, mean: np.ndarray, std: np.ndarray):
         """
         Initialize normalizer.
-        
+
         Args:
             mean: Mean values for each observation dimension
             std: Standard deviation values for each dimension
-            clip: Clip normalized values to [-clip, clip]
         """
         # Store as JAX arrays for JIT compatibility
         self.mean = jnp.array(mean, dtype=jnp.float32).flatten()
         self.std = jnp.array(std, dtype=jnp.float32).flatten()
-        self.clip = clip
-        
         # Avoid division by zero
         self.std = jnp.maximum(self.std, 1e-8)
-    
+
     def __call__(self, obs):
         """Normalize observation. Works with both numpy and JAX arrays."""
-        # Ensure JAX array (avoid conversion if already JAX)
         if not isinstance(obs, jnp.ndarray):
             obs = jnp.array(obs)
-        normalized = (obs - self.mean) / self.std
-        return jnp.clip(normalized, -self.clip, self.clip)
+        return (obs - self.mean) / self.std
     
     def normalize(self, obs):
         """Normalize observation (alias for __call__)."""
         return self(obs)
     
     @classmethod
-    def from_dict(cls, normalizer_dict: Dict[str, np.ndarray], clip: float = 10.0):
+    def from_dict(cls, normalizer_dict: Dict[str, np.ndarray]):
         """Create normalizer from dict with 'mean' and 'std' keys."""
-        return cls(normalizer_dict['mean'], normalizer_dict['std'], clip=clip)
-    
+        return cls(normalizer_dict['mean'], normalizer_dict['std'])
+
     @classmethod
-    def from_brax_params(cls, normalizer_params, clip: float = 10.0):
+    def from_brax_params(cls, normalizer_params):
         """Create normalizer from Brax RunningStatisticsState."""
         return cls(
             np.array(normalizer_params.mean),
             np.array(normalizer_params.std),
-            clip=clip,
         )
 
 
@@ -516,21 +504,15 @@ def verify_brax_wsrl_equivalence(
         num_steps: Number of steps to compare
         num_envs: Number of parallel environments
         seed: Random seed
-        tolerance: Tolerance for numerical differences
-        
-    Returns:
-        Dictionary with verification results:
-        - 'policy_match': bool, whether actions match
-        - 'q_match': bool, whether Q-values match
-        - 'action_diffs': list of action differences per step
-        - 'q_diffs': list of Q-value differences per step
-        - 'max_action_diff': float, maximum action difference
-        - 'max_q_diff': float, maximum Q-value difference
+        tolerance: Used as rtol (relative tolerance) for np.testing.assert_allclose on actions, Q, and target Q; atol=1e-8.
     """
     
     # Create Brax SAC networks
     obs_size = brax_env.observation_size
     action_size = brax_env.action_size
+
+    # Create wsrl policy function (with normalizer)
+    brax_normalizer = BraxNormalizer.from_brax_params(brax_normalizer_params)
 
     wsrl_agent: SACAgent
     
@@ -599,22 +581,16 @@ def verify_brax_wsrl_equivalence(
 
     logging.info(f"Verification using dtype: {env_state.obs.dtype}")
     
-    # Create wsrl policy function (with normalizer)
-    brax_normalizer = BraxNormalizer.from_brax_params(brax_normalizer_params)
-    
-    def wsrl_policy_fn(obs, key):
+    def wsrl_policy_fn(obs):
         """Get actions from wsrl agent."""
         normalized_obs = brax_normalizer(obs)
         actions = wsrl_agent.sample_actions(normalized_obs, argmax=True)
-        return actions, {}
+        return actions
     
     # Collect step-by-step comparisons
     action_diffs = []
     q_diffs = []
     target_q_diffs = []
-    policy_match = True
-    q_match = True
-    target_q_match = True
     
     step_fn = jax.jit(wrapped_env.step)
 
@@ -622,22 +598,20 @@ def verify_brax_wsrl_equivalence(
     for step in tqdm(range(num_steps), total=num_steps, desc="Verifying Brax-wsrl equivalence"):
         obs = env_state.obs
         
-        # Get actions from both policies
-        rng, brax_key, wsrl_key = jax.random.split(rng, 3)
-        brax_actions, _ = brax_policy_fn(obs, brax_key)
-        wsrl_actions, _ = wsrl_policy_fn(obs, wsrl_key)
+        # Get actions from both policies (same key for fair equivalence check)
+        brax_actions, _ = brax_policy_fn(obs, rng)
+        wsrl_actions = wsrl_policy_fn(obs)
         
         # Compare actions
         action_diff = jnp.abs(brax_actions - wsrl_actions)
         max_action_diff = jnp.max(action_diff)
         action_diffs.append(float(max_action_diff))
         
-        if max_action_diff > tolerance:
-            policy_match = False
-            logging.warning(
-                f"Step {step}: Action mismatch! Max diff: {max_action_diff:.6f}, "
-                f"Mean diff: {jnp.mean(action_diff):.6f}"
-            )
+        np.testing.assert_allclose(
+            np.asarray(wsrl_actions), np.asarray(brax_actions),
+            rtol=tolerance, atol=1e-8,
+            err_msg=f"Step {step}: Action mismatch"
+        )
         
         brax_q = brax_q_fn(obs, brax_actions)
         wsrl_q = wsrl_q_fn(obs, brax_actions)
@@ -647,12 +621,11 @@ def verify_brax_wsrl_equivalence(
         max_q_diff = jnp.max(q_diff)
         q_diffs.append(float(max_q_diff))
         
-        if max_q_diff > tolerance:
-            q_match = False
-            logging.warning(
-                f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
-                f"Mean diff: {jnp.mean(q_diff):.6f}"
-            )
+        np.testing.assert_allclose(
+            np.asarray(wsrl_q), np.asarray(brax_q),
+            rtol=tolerance, atol=1e-8,
+            err_msg=f"Step {step}: Q-value mismatch"
+        )
         
         brax_target_q = brax_target_q_fn(obs, brax_actions)
         wsrl_target_q = wsrl_target_q_fn(obs, brax_actions)
@@ -662,22 +635,19 @@ def verify_brax_wsrl_equivalence(
         max_target_q_diff = jnp.max(target_q_diff)
         target_q_diffs.append(float(max_target_q_diff))
         
-        if max_target_q_diff > tolerance:
-            target_q_match = False
-            logging.warning(
-                f"Step {step}: Q-value mismatch! Max diff: {max_q_diff:.6f}, "
-                f"Mean diff: {jnp.mean(target_q_diff):.6f}"
-            )
+        np.testing.assert_allclose(
+            np.asarray(wsrl_target_q), np.asarray(brax_target_q),
+            rtol=tolerance, atol=1e-8,
+            err_msg=f"Step {step}: Target Q-value mismatch"
+        )
         
         # Step environment using Brax actions (for consistency)
         env_state = step_fn(env_state, brax_actions)
-
-        if not policy_match or not q_match or not target_q_match:
-            raise ValueError("Verification failed")
     
     results = {
-        'policy_match': policy_match,
-        'q_match': q_match,
+        'policy_match': True,
+        'q_match': True,
+        'target_q_match': True,
         'action_diffs': action_diffs,
         'q_diffs': q_diffs,
         'max_action_diff': max(action_diffs) if action_diffs else 0.0,
@@ -688,9 +658,9 @@ def verify_brax_wsrl_equivalence(
         'mean_target_q_diff': np.mean(target_q_diffs) if target_q_diffs else 0.0,
     }
     
-    logging.info(f"Verification complete:")
-    logging.info(f"  Policy match: {policy_match} (max diff: {results['max_action_diff']:.6f})")
-    logging.info(f"  Q-network match: {q_match} (max diff: {results['max_q_diff']:.6f})")
-    logging.info(f"  Target Q-network match: {target_q_match} (max diff: {results['max_target_q_diff']:.6f})")
+    logging.info("Verification complete:")
+    logging.info(f"  Policy match (max diff: {results['max_action_diff']:.6f})")
+    logging.info(f"  Q-network match (max diff: {results['max_q_diff']:.6f})")
+    logging.info(f"  Target Q-network match (max diff: {results['max_target_q_diff']:.6f})")
     
     return results

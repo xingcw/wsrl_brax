@@ -551,7 +551,7 @@ def main(_):
             num_steps=100,
             num_envs=FLAGS.num_envs,
             seed=FLAGS.seed,
-            tolerance=2e-3,
+            tolerance=1e-4,
         )
         jax.config.update("jax_default_matmul_precision", prev_matmul_precision)
         logging.info("Verification passed!")
