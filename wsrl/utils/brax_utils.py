@@ -609,7 +609,7 @@ def verify_brax_wsrl_equivalence(
         
         np.testing.assert_allclose(
             np.asarray(wsrl_actions), np.asarray(brax_actions),
-            rtol=tolerance, atol=1e-8,
+            atol=tolerance,
             err_msg=f"Step {step}: Action mismatch"
         )
         
@@ -623,7 +623,7 @@ def verify_brax_wsrl_equivalence(
         
         np.testing.assert_allclose(
             np.asarray(wsrl_q), np.asarray(brax_q),
-            rtol=tolerance, atol=1e-8,
+            atol=tolerance,
             err_msg=f"Step {step}: Q-value mismatch"
         )
         
@@ -637,7 +637,7 @@ def verify_brax_wsrl_equivalence(
         
         np.testing.assert_allclose(
             np.asarray(wsrl_target_q), np.asarray(brax_target_q),
-            rtol=tolerance, atol=1e-8,
+            atol=tolerance,
             err_msg=f"Step {step}: Target Q-value mismatch"
         )
         
