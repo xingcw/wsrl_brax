@@ -124,6 +124,10 @@ flags.DEFINE_string("agent", "sac", "RL agent to use (sac recommended for Brax)"
 flags.DEFINE_integer("utd", 4, "Update-to-data ratio of the critic")
 flags.DEFINE_integer("batch_size", 256, "Batch size for training")
 flags.DEFINE_integer("replay_buffer_capacity", int(2e6), "Replay buffer capacity")
+flags.DEFINE_float("actor_learning_rate", 1e-4, "Learning rate for actor")
+flags.DEFINE_float("critic_learning_rate", 3e-4, "Learning rate for critic")
+flags.DEFINE_float("temperature_learning_rate", 1e-4, "Learning rate for temperature")
+flags.DEFINE_float("temperature_init", 1.0, "Initial temperature value")
 
 # Experiment house keeping
 flags.DEFINE_integer("seed", 0, "Random seed.")
@@ -275,6 +279,12 @@ def main(_):
     
     # Add FLAGS to variant for full tracking
     variant = FLAGS.config.to_dict()
+    
+    # Define optimizer learning rates (used in agent creation and logged to wandb)
+    actor_lr = FLAGS.actor_learning_rate
+    critic_lr = FLAGS.critic_learning_rate
+    temperature_lr = FLAGS.temperature_learning_rate
+    
     variant.update({
         "seed": FLAGS.seed,
         "brax_env": FLAGS.brax_env,
@@ -282,7 +292,13 @@ def main(_):
         "num_online_steps": FLAGS.num_online_steps,
         "batch_size": FLAGS.batch_size,
         "utd": FLAGS.utd,
+        "actor_optimizer_kwargs": {"learning_rate": actor_lr},
+        "critic_optimizer_kwargs": {"learning_rate": critic_lr},
+        "temperature_optimizer_kwargs": {"learning_rate": temperature_lr},
+        "temperature_init": FLAGS.temperature_init,
     })
+
+    wandb_config.update(variant)
     
     # If resuming, use the saved run ID to continue the same wandb run
     if resumed_wandb_run_id:
@@ -340,9 +356,10 @@ def main(_):
             random_str_in_identifier=True,
             disable_online_logging=FLAGS.debug,
         )
-    
+        
     # Save wandb run ID for future resumption (must be set for checkpoint to support wandb resume)
     import wandb as _wandb
+    _wandb.config.update(wandb_config)
     current_wandb_run_id = None
     if hasattr(wandb_logger, 'run') and wandb_logger.run is not None:
         current_wandb_run_id = getattr(wandb_logger.run, 'id', None)
@@ -445,23 +462,52 @@ def main(_):
     FLAGS.config.agent_kwargs.critic_network_kwargs.hidden_dims = (256, 256)
     logging.info(f"Using hidden dims {brax_hidden_dims} for policy")
     
+    # Extract any additional agent kwargs, excluding ones we pass explicitly below
+    extra_agent_kwargs = {
+        k: v
+        for k, v in FLAGS.config.agent_kwargs.items()
+        if k
+        not in [
+            "critic_network_kwargs",
+            "policy_network_kwargs",
+            "policy_kwargs",
+            "critic_ensemble_size",
+            "critic_subsample_size",
+            "temperature_init",
+            "actor_optimizer_kwargs",
+            "critic_optimizer_kwargs",
+            "temperature_optimizer_kwargs",
+        ]
+    }
+
     agent = agents[FLAGS.agent].create_brax_compatible(
         rng=construct_rng,
         observations=example_batch["observations"],
         actions=example_batch["actions"],
-        critic_network_kwargs=FLAGS.config.agent_kwargs['critic_network_kwargs'],
-        policy_network_kwargs=FLAGS.config.agent_kwargs['policy_network_kwargs'],
-        policy_kwargs=FLAGS.config.agent_kwargs.get('policy_kwargs', {
-            "tanh_squash_distribution": True,
-            "std_parameterization": "exp",
-        }),
-        critic_ensemble_size=FLAGS.config.agent_kwargs.get('critic_ensemble_size', 2),
-        critic_subsample_size=FLAGS.config.agent_kwargs.get('critic_subsample_size', None),
-        temperature_init=FLAGS.config.agent_kwargs.get('temperature_init', 1.0),
-        **{k: v for k, v in FLAGS.config.agent_kwargs.items() 
-            if k not in ['critic_network_kwargs', 'policy_network_kwargs', 
-                        'policy_kwargs', 'critic_ensemble_size', 
-                        'critic_subsample_size', 'temperature_init']},
+        critic_network_kwargs=FLAGS.config.agent_kwargs["critic_network_kwargs"],
+        policy_network_kwargs=FLAGS.config.agent_kwargs["policy_network_kwargs"],
+        policy_kwargs=FLAGS.config.agent_kwargs.get(
+            "policy_kwargs",
+            {
+                "tanh_squash_distribution": True,
+                "std_parameterization": "exp",
+            },
+        ),
+        critic_ensemble_size=FLAGS.config.agent_kwargs.get("critic_ensemble_size", 2),
+        critic_subsample_size=FLAGS.config.agent_kwargs.get(
+            "critic_subsample_size", None
+        ),
+        temperature_init=FLAGS.temperature_init,
+        actor_optimizer_kwargs={
+            "learning_rate": actor_lr,
+        },
+        critic_optimizer_kwargs={
+            "learning_rate": critic_lr,
+        },
+        temperature_optimizer_kwargs={
+            "learning_rate": temperature_lr,
+        },
+        **extra_agent_kwargs,
     )
 
     # Load wsrl checkpoint if specified (for transfer learning, not resumption)
